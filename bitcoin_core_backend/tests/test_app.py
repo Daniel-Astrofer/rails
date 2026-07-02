@@ -10,7 +10,7 @@ from bitcoin_core_backend.app import create_app
 from bitcoin_core_backend.config import AppConfig
 
 
-def test_config(state_db_path):
+def app_config(state_db_path):
     return AppConfig(
         rpc_url="http://127.0.0.1:18443",
         rpc_user="user",
@@ -37,7 +37,7 @@ def test_config(state_db_path):
 class AppRouteTests(unittest.TestCase):
     def test_malformed_json_returns_structured_400(self):
         with tempfile.NamedTemporaryFile() as tmp:
-            app = create_app(test_config(tmp.name))
+            app = create_app(app_config(tmp.name))
 
             response = app.test_client().post(
                 "/v1/wallets",
@@ -52,7 +52,7 @@ class AppRouteTests(unittest.TestCase):
 
     def test_json_null_body_returns_structured_400(self):
         with tempfile.NamedTemporaryFile() as tmp:
-            app = create_app(test_config(tmp.name))
+            app = create_app(app_config(tmp.name))
 
             response = app.test_client().post(
                 "/v1/wallets",
@@ -67,7 +67,7 @@ class AppRouteTests(unittest.TestCase):
 
     def test_idempotent_replay_uses_current_request_id(self):
         with tempfile.NamedTemporaryFile() as tmp:
-            app = create_app(test_config(tmp.name))
+            app = create_app(app_config(tmp.name))
             client = app.test_client()
 
             with patch("bitcoin_core_backend.rpc.BitcoinRPCClient.call", return_value=["kerosene"]) as call:
