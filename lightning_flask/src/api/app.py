@@ -5,10 +5,10 @@ from typing import Any
 
 from flask import Flask, g, jsonify, request
 
-from cohesion import CohesionStore
-from config import Settings
-from lnd import LndClient
-from security import (
+from src.infra.cohesion import CohesionStore
+from src.core.config import Settings
+from src.infra.lnd import LndClient
+from src.core.security import (
     ApiError,
     RateLimiter,
     parse_optional_int,

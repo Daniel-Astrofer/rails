@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from errors import ApiError
-from store import CohesionStore
+from src.core.errors import ApiError
+from src.infra.store import CohesionStore
 
 
 class CohesionStoreTests(unittest.TestCase):
@@ -22,10 +22,10 @@ class CohesionStoreTests(unittest.TestCase):
     def test_expired_idempotency_key_can_be_reused_for_new_scope(self):
         with tempfile.NamedTemporaryFile() as tmp:
             store = CohesionStore(tmp.name, idempotency_ttl_seconds=1)
-            with patch("store.time.time", return_value=1000):
+            with patch("src.infra.store.time.time", return_value=1000):
                 store.store_response("request-000001", "POST:/v1/a", "hash-a", 200, {"route": "a"})
 
-            with patch("store.time.time", return_value=1002):
+            with patch("src.infra.store.time.time", return_value=1002):
                 self.assertIsNone(store.get_replay("request-000001", "POST:/v1/a", "hash-a"))
                 store.store_response("request-000001", "POST:/v1/b", "hash-b", 201, {"route": "b"})
                 self.assertEqual(

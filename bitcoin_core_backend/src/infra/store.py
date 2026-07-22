@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .errors import ApiError
+from src.core.errors import ApiError
 
 
 class CohesionStore:

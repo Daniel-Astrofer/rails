@@ -10,8 +10,8 @@ if importlib.util.find_spec("flask") is None:
     raise unittest.SkipTest("Flask is not installed")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import create_app
-from config import Settings
+from src.api.app import create_app
+from src.core.config import Settings
 
 
 PAYMENT_HASH = "a" * 64

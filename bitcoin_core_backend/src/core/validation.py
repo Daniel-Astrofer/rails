@@ -6,7 +6,7 @@ import re
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 
-from .errors import ApiError
+from src.core.errors import ApiError
 
 SATOSHIS_PER_BTC = Decimal("100000000")
 

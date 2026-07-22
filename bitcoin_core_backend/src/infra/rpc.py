@@ -8,8 +8,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 
-from .config import AppConfig
-from .errors import RpcError
+from src.core.config import AppConfig
+from src.core.errors import RpcError
 
 
 class BitcoinRPCClient:

@@ -10,8 +10,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from config import Settings
-from security import ApiError, validate_payment_hash
+from src.core.config import Settings
+from src.core.security import ApiError, validate_payment_hash
 
 
 class LndClient:

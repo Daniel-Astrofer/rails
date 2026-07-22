@@ -10,12 +10,12 @@ from typing import Any, Callable
 from flask import Flask, Response, g, jsonify, request
 from werkzeug.exceptions import BadRequest
 
-from .config import AppConfig
-from .errors import ApiError, RpcError, rpc_error_to_api_error
-from .rpc import BitcoinRPCClient
-from .services import BitcoinBackendService, fingerprint_for_request
-from .store import CohesionStore
-from .validation import validate_idempotency_key, validate_wallet_name
+from src.core.config import AppConfig
+from src.core.errors import ApiError, RpcError, rpc_error_to_api_error
+from src.infra.rpc import BitcoinRPCClient
+from src.services.bitcoin_service import BitcoinBackendService, fingerprint_for_request
+from src.infra.store import CohesionStore
+from src.core.validation import validate_idempotency_key, validate_wallet_name
 
 
 JsonHandler = Callable[[dict[str, Any], str | None, str], tuple[dict[str, Any], int] | dict[str, Any]]
