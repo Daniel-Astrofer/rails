@@ -1,7 +1,7 @@
 import unittest
 
-from bitcoin_core_backend.errors import ApiError
-from bitcoin_core_backend.validation import (
+from errors import ApiError
+from validation import (
     btc_to_sats,
     normalize_outputs,
     parse_non_negative_int,

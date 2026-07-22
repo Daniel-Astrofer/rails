@@ -6,8 +6,8 @@ from unittest.mock import patch
 if importlib.util.find_spec("flask") is None or importlib.util.find_spec("requests") is None:
     raise unittest.SkipTest("Flask test dependencies are not installed")
 
-from bitcoin_core_backend.app import create_app
-from bitcoin_core_backend.config import AppConfig
+from app import create_app
+from config import AppConfig
 
 
 def app_config(state_db_path):
@@ -70,7 +70,7 @@ class AppRouteTests(unittest.TestCase):
             app = create_app(app_config(tmp.name))
             client = app.test_client()
 
-            with patch("bitcoin_core_backend.rpc.BitcoinRPCClient.call", return_value=["kerosene"]) as call:
+            with patch("rpc.BitcoinRPCClient.call", return_value=["kerosene"]) as call:
                 first = client.post(
                     "/v1/wallets",
                     json={"name": "kerosene"},
