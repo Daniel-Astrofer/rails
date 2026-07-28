@@ -15,19 +15,37 @@ from src.core.config import Settings
 
 
 PAYMENT_HASH = "a" * 64
-INVOICE = "lnbc1" + "p" * 80
+# Valid BOLT11-like invoice for testing: 500 uBTC = 50000 sats, under test limit of 100000
+INVOICE = "lnbc500u1" + "a" * 79
 
 
 class FakeLndClient:
     def __init__(self):
         self.invoice_calls = 0
         self.payment_calls = 0
+        self.decode_called = False
 
     def node_status(self):
-        return {"alias": "kerosene-lnd", "synced_to_chain": True, "block_height": 100}
+        return {"alias": "kerosene-lnd", "synced_to_chain": True, "synced_to_graph": True, "block_height": 100}
 
     def list_channels(self):
         return {"channels": [{"active": True, "remote_pubkey": "02" + "b" * 64, "capacity_sats": 1000}]}
+
+    def get_info(self):
+        return {"chains": [{"chain": "bitcoin", "network": "mainnet"}]}
+
+    def decode_invoice(self, payment_request):
+        self.decode_called = True
+        return {
+            "payment_hash": PAYMENT_HASH,
+            "num_satoshis": 50000,
+            "timestamp": 0,
+            "expiry": 3600,
+            "destination": "03" + "c" * 64,
+            "cltv_expiry": 144,
+            "description": "test invoice",
+            "network": "mainnet",
+        }
 
     def create_invoice(self, amount_sats, memo, expiry_seconds):
         self.invoice_calls += 1
@@ -42,11 +60,11 @@ class FakeLndClient:
     def lookup_invoice(self, payment_hash):
         return {"payment_hash": payment_hash, "amount_sats": 2500, "state": "OPEN", "settled": False}
 
-    def pay_invoice(self, payment_request, fee_limit_sats, timeout_seconds):
+    def pay_invoice(self, payment_request, fee_limit_sats, timeout_seconds, amount_sats=None):
         self.payment_calls += 1
         return {
             "payment_hash": PAYMENT_HASH,
-            "payment_preimage": "secret-preimage",
+            "payment_error": "",
             "status": "submitted",
             "fee_limit_sats": fee_limit_sats,
         }
@@ -58,18 +76,29 @@ class FakeLndClient:
 class LightningAppTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(delete=True)
+        token = "x" * 64  # 32 bytes entropy (hex)
         self.settings = Settings(
-            api_token="x" * 32,
+            api_token=token,
+            read_token=token,
+            write_token=token,
+            admin_token="",
+            network="mainnet",
             lnd_rest_url="https://127.0.0.1:8080",
             lnd_macaroon_hex="00" * 32,
             sqlite_path=self.tmp.name,
             rate_limit_per_minute=1000,
             max_invoice_sats=100_000,
             max_payment_sats=100_000,
+            max_fee_sats=5000,
+            max_fee_ppm=500,
+            max_daily_payment_sats=1_000_000,
+            max_in_flight_sats=500_000,
+            auth_disabled=False,
+            production=False,
         )
         self.lnd = FakeLndClient()
         self.client = create_app(self.settings, self.lnd).test_client()
-        self.headers = {"Authorization": "Bearer " + "x" * 32}
+        self.headers = {"Authorization": "Bearer " + "x" * 64}
 
     def test_health_is_public(self):
         response = self.client.get("/health")
@@ -84,7 +113,9 @@ class LightningAppTests(unittest.TestCase):
         response = self.client.get("/v1/node/status", headers=self.headers)
         body = response.get_json()
         self.assertEqual(200, response.status_code)
-        self.assertEqual("kerosene-lnd", body["node"]["alias"])
+        self.assertTrue(body["node"]["synced_to_chain"])
+        self.assertEqual(100, body["node"]["block_height"])
+        self.assertEqual("mainnet", body["node"]["network"])
         self.assertEqual("no-store", response.headers["Cache-Control"])
         self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
 
@@ -106,18 +137,18 @@ class LightningAppTests(unittest.TestCase):
         self.assertEqual(409, second.status_code)
 
     def test_invoice_amount_validation(self):
-        headers = {**self.headers, "Content-Type": "application/json"}
+        headers = {**self.headers, "Content-Type": "application/json", "Idempotency-Key": "invoice-amount-test"}
         response = self.client.post("/v1/invoices", json={"amount_sats": 100_001}, headers=headers)
         self.assertEqual(400, response.status_code)
 
     def test_pay_invoice_validation_and_audit_sanitization(self):
-        headers = {**self.headers, "Content-Type": "application/json", "Idempotency-Key": "pay-1"}
+        headers = {**self.headers, "Content-Type": "application/json", "Idempotency-Key": "payment-request-0001"}
         response = self.client.post(
             "/v1/payments",
             json={"payment_request": INVOICE, "fee_limit_sats": 10, "timeout_seconds": 30},
             headers=headers,
         )
-        self.assertEqual(202, response.status_code)
+        self.assertEqual(202, response.status_code, response.get_json())
         self.assertEqual(1, self.lnd.payment_calls)
 
         snapshot = self.client.get("/v1/cohesion/snapshot", headers=self.headers).get_json()["cohesion"]
@@ -127,7 +158,7 @@ class LightningAppTests(unittest.TestCase):
         self.assertNotIn("payment_preimage", metadata)
 
     def test_rejects_invalid_bolt11(self):
-        headers = {**self.headers, "Content-Type": "application/json"}
+        headers = {**self.headers, "Content-Type": "application/json", "Idempotency-Key": "bolt11-test"}
         response = self.client.post("/v1/payments", json={"payment_request": "not-an-invoice"}, headers=headers)
         self.assertEqual(400, response.status_code)
 

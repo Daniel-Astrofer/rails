@@ -12,7 +12,29 @@ import pytest
 
 PAYMENT_HASH = "a" * 64
 SECOND_HASH = "b" * 64
-INVOICE = "lnbcrt1" + "p" * 80
+INVOICE = "lntb1" + "p" * 80
+
+
+@pytest.fixture(scope="module")
+def lightning_modules():
+    from src.api import app
+    from src.core import config, security
+    from src.infra import lnd
+
+    return {
+        "app": app,
+        "config": config,
+        "security": security,
+        "lnd": lnd,
+    }
+
+
+@pytest.fixture
+def bearer_headers():
+    return {
+        "Authorization": f"Bearer {'x' * 64}",
+        "Idempotency-Key": "test-request-000001",
+    }
 
 
 def header_value(headers: dict[str, str], name: str) -> str | None:
@@ -74,7 +96,7 @@ class FakeLnd:
             {"payment_hash": payment_hash, "amount_sats": 0, "state": "UNKNOWN", "settled": False},
         )
 
-    def pay_invoice(self, payment_request, fee_limit_sats, timeout_seconds):
+    def pay_invoice(self, payment_request, fee_limit_sats, timeout_seconds, amount_sats=None):
         self.payment_calls += 1
         payment = {
             "payment_hash": PAYMENT_HASH,
@@ -85,6 +107,21 @@ class FakeLnd:
         }
         self.payments[PAYMENT_HASH] = payment
         return payment
+
+    def decode_invoice(self, payment_request):
+        return {
+            "payment_hash": PAYMENT_HASH,
+            "num_satoshis": 50000,
+            "timestamp": 0,
+            "expiry": 3600,
+            "destination": "03" + "c" * 64,
+            "cltv_expiry": 144,
+            "description": "test invoice",
+            "network": "testnet",
+        }
+
+    def get_info(self):
+        return {"chains": [{"chain": "bitcoin", "network": "testnet"}]}
 
     def lookup_payment(self, payment_hash):
         return self.payments.get(payment_hash, {"payment_hash": payment_hash, "status": "unknown"})
@@ -105,15 +142,25 @@ def lightning_app(tmp_path, lightning_modules):
     create_app = lightning_modules["app"].create_app
     lnd = FakeLnd()
     settings = Settings(
-        api_token="x" * 32,
+        api_token="x" * 64,
+        read_token="x" * 64,
+        write_token="x" * 64,
+        admin_token="",
         lnd_rest_url="https://127.0.0.1:8080",
         lnd_macaroon_hex="00" * 32,
+        network="testnet",
         sqlite_path=str(tmp_path / "lightning.sqlite3"),
         rate_limit_per_minute=1_000,
         max_body_bytes=4096,
         max_invoice_sats=100_000,
         max_payment_sats=100_000,
+        max_fee_sats=5000,
+        max_fee_ppm=500,
+        max_daily_payment_sats=1_000_000,
+        max_in_flight_sats=500_000,
         default_invoice_expiry_seconds=900,
+        auth_disabled=False,
+        production=False,
     )
     return create_app(settings, lnd).test_client(), lnd
 
@@ -134,8 +181,13 @@ def test_node_status_channels_and_security_headers(lightning_app, bearer_headers
     assert status.status_code == 200
     assert status.headers["Cache-Control"] == "no-store"
     assert status.headers["X-Content-Type-Options"] == "nosniff"
-    assert status.get_json()["node"]["alias"] == "kerosene-lnd"
-    assert channels.get_json()["channels"][0]["capacity_sats"] == 250_000
+    node = status.get_json()["node"]
+    assert node["synced_to_chain"] is True
+    assert node["synced_to_graph"] is True
+    assert node["network"] == "testnet"
+    ch = channels.get_json()
+    assert ch["activeChannelCount"] >= 0
+    assert "outboundLiquiditySats" in ch
 
 
 def test_invoice_creation_idempotency_and_snapshot(lightning_app, bearer_headers):
@@ -169,7 +221,7 @@ def test_invoice_settlement_simulation(lightning_app, bearer_headers):
 
 def test_payment_submission_redacts_sensitive_event_metadata(lightning_app, bearer_headers):
     client, lnd = lightning_app
-    headers = {**bearer_headers, "Idempotency-Key": "pay-1"}
+    headers = {**bearer_headers, "Idempotency-Key": "payment-request-0001"}
 
     response = client.post(
         "/v1/payments",
@@ -179,7 +231,7 @@ def test_payment_submission_redacts_sensitive_event_metadata(lightning_app, bear
     payment = client.get(f"/v1/payments/{PAYMENT_HASH}", headers=bearer_headers)
     snapshot = client.get("/v1/cohesion/snapshot", headers=bearer_headers).get_json()["cohesion"]
 
-    assert response.status_code == 202
+    assert response.status_code == 202, response.get_json()
     assert payment.get_json()["payment"]["status"] == "submitted"
     assert lnd.payment_calls == 1
     assert snapshot["recent_events"][0]["event_type"] == "payment_submitted"
@@ -263,9 +315,13 @@ def test_lnd_client_creates_invoice_from_base64_hash(monkeypatch, tmp_path, ligh
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     client = LndClient(
         Settings(
-            api_token="x" * 32,
+            api_token="x" * 64,
+            read_token="x" * 64,
+            write_token="x" * 64,
+            admin_token="",
             lnd_rest_url="https://lnd.local:8080/",
             lnd_macaroon_hex="ab" * 32,
+            network="testnet",
             sqlite_path=str(tmp_path / "unused.sqlite3"),
         )
     )
@@ -297,9 +353,13 @@ def test_lnd_client_status_maps_numeric_strings_and_caches(monkeypatch, tmp_path
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     client = LndClient(
         Settings(
-            api_token="x" * 32,
+            api_token="x" * 64,
+            read_token="x" * 64,
+            write_token="x" * 64,
+            admin_token="",
             lnd_rest_url="https://lnd.local:8080",
             lnd_macaroon_hex="ab" * 32,
+            network="testnet",
             sqlite_path=str(tmp_path / "unused.sqlite3"),
             status_cache_seconds=60,
         )
@@ -320,9 +380,13 @@ def test_lnd_client_maps_http_and_network_errors(monkeypatch, tmp_path, lightnin
     ApiError = lightning_modules["security"].ApiError
     client = LndClient(
         Settings(
-            api_token="x" * 32,
+            api_token="x" * 64,
+            read_token="x" * 64,
+            write_token="x" * 64,
+            admin_token="",
             lnd_rest_url="https://lnd.local:8080",
             lnd_macaroon_hex="ab" * 32,
+            network="testnet",
             sqlite_path=str(tmp_path / "unused.sqlite3"),
         )
     )

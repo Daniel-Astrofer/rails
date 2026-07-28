@@ -18,6 +18,9 @@ def app_config(state_db_path):
         default_wallet="kerosene",
         chain="regtest",
         api_keys=frozenset(),
+        read_api_keys=frozenset(),
+        write_api_keys=frozenset(),
+        admin_token="",
         auth_disabled=True,
         allow_wallet_create=False,
         allow_broadcast=False,
@@ -31,13 +34,22 @@ def app_config(state_db_path):
         idempotency_ttl_seconds=3600,
         state_db_path=state_db_path,
         rate_limit_per_minute=100,
+        rate_limit_backend="memory",
+        redis_url="",
     )
+
+def create_test_app(state_db_path):
+    with patch(
+        "src.infra.rpc.BitcoinRPCClient.call",
+        return_value={"chain": "regtest"},
+    ):
+        return create_app(app_config(state_db_path))
 
 
 class AppRouteTests(unittest.TestCase):
     def test_malformed_json_returns_structured_400(self):
         with tempfile.NamedTemporaryFile() as tmp:
-            app = create_app(app_config(tmp.name))
+            app = create_test_app(tmp.name)
 
             response = app.test_client().post(
                 "/v1/wallets",
@@ -52,7 +64,7 @@ class AppRouteTests(unittest.TestCase):
 
     def test_json_null_body_returns_structured_400(self):
         with tempfile.NamedTemporaryFile() as tmp:
-            app = create_app(app_config(tmp.name))
+            app = create_test_app(tmp.name)
 
             response = app.test_client().post(
                 "/v1/wallets",
@@ -67,7 +79,7 @@ class AppRouteTests(unittest.TestCase):
 
     def test_idempotent_replay_uses_current_request_id(self):
         with tempfile.NamedTemporaryFile() as tmp:
-            app = create_app(app_config(tmp.name))
+            app = create_test_app(tmp.name)
             client = app.test_client()
 
             with patch("src.infra.rpc.BitcoinRPCClient.call", return_value=["kerosene"]) as call:

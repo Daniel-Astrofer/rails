@@ -72,7 +72,14 @@ class LndClient:
         result = self.get(f"/v1/invoice/{payment_hash}")
         return _invoice_view(result, fallback_hash=payment_hash)
 
-    def pay_invoice(self, payment_request: str, fee_limit_sats: int, timeout_seconds: int) -> dict[str, Any]:
+    def pay_invoice(self, payment_request: str, fee_limit_sats: int, timeout_seconds: int, amount_sats: int | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "payment_request": payment_request,
+            "fee_limit": {"fixed": str(fee_limit_sats)},
+            "timeout_seconds": timeout_seconds,
+        }
+        if amount_sats is not None:
+            body["amt"] = str(amount_sats)
         result = self.post(
             "/v1/channels/transactions",
             {
@@ -82,14 +89,41 @@ class LndClient:
             },
         )
         payment_hash = result.get("payment_hash") or _hash_to_hex(result.get("payment_hash_bytes"))
+        # Security: strip payment_preimage and payment_route — these reveal
+        # payment path details and proof-of-payment secrets. Only log preimage
+        # at DEBUG level for troubleshooting.
+        import logging
+        _log = logging.getLogger(__name__)
+        preimage = result.get("payment_preimage")
+        if preimage:
+            _log.debug("Payment preimage available for hash %s (not stored)", payment_hash)
         return {
             "payment_hash": payment_hash,
-            "payment_preimage": result.get("payment_preimage"),
-            "payment_route": result.get("payment_route"),
             "payment_error": result.get("payment_error"),
             "status": "failed" if result.get("payment_error") else "submitted",
             "fee_limit_sats": fee_limit_sats,
         }
+
+    def decode_invoice(self, payment_request: str) -> dict[str, Any]:
+        """Decode a BOLT11 invoice using LND's /v1/payreq/{payment_request} REST endpoint.
+        Returns decoded fields: num_satoshis, timestamp, expiry, destination, payment_hash,
+        cltv_expiry, description, network."""
+        result = self.get(f"/v1/payreq/{urllib.parse.quote(payment_request, safe='')}")
+        payment_hash = result.get("payment_hash") or _hash_to_hex(result.get("payment_hash_bytes"))
+        return {
+            "payment_hash": payment_hash,
+            "num_satoshis": _as_int(result.get("num_satoshis")),
+            "timestamp": _as_int(result.get("timestamp")),
+            "expiry": _as_int(result.get("expiry")),
+            "destination": result.get("destination"),
+            "cltv_expiry": _as_int(result.get("cltv_expiry")),
+            "description": result.get("description"),
+            "network": result.get("network", "").lower(),
+        }
+
+    def get_info(self) -> dict[str, Any]:
+        """Return LND node info for startup network validation."""
+        return self.get("/v1/getinfo")
 
     def lookup_payment(self, payment_hash: str) -> dict[str, Any]:
         payment_hash = validate_payment_hash(payment_hash)
