@@ -80,14 +80,7 @@ class LndClient:
         }
         if amount_sats is not None:
             body["amt"] = str(amount_sats)
-        result = self.post(
-            "/v1/channels/transactions",
-            {
-                "payment_request": payment_request,
-                "fee_limit": {"fixed": str(fee_limit_sats)},
-                "timeout_seconds": timeout_seconds,
-            },
-        )
+        result = self.post("/v1/channels/transactions", body)
         payment_hash = result.get("payment_hash") or _hash_to_hex(result.get("payment_hash_bytes"))
         # Security: strip payment_preimage and payment_route — these reveal
         # payment path details and proof-of-payment secrets. Only log preimage
@@ -127,17 +120,35 @@ class LndClient:
 
     def lookup_payment(self, payment_hash: str) -> dict[str, Any]:
         payment_hash = validate_payment_hash(payment_hash)
-        result = self.get("/v1/payments", {"include_incomplete": "true", "payment_hash": payment_hash})
-        payments = result.get("payments") if isinstance(result, dict) else None
-        if isinstance(payments, list) and payments:
-            payment = payments[0]
-            return {
-                "payment_hash": payment.get("payment_hash", payment_hash),
-                "status": payment.get("status"),
-                "value_sats": _as_int(payment.get("value_sat")),
-                "fee_sats": _as_int(payment.get("fee_sat")),
-                "creation_time_ns": payment.get("creation_time_ns"),
-            }
+        index_offset = 0
+        for _ in range(20):
+            result = self.get(
+                "/v1/payments",
+                {
+                    "include_incomplete": "true",
+                    "reversed": "true",
+                    "max_payments": "100",
+                    "index_offset": str(index_offset),
+                },
+            )
+            payments = result.get("payments") if isinstance(result, dict) else None
+            if not isinstance(payments, list) or not payments:
+                break
+            for payment in payments:
+                candidate = str(payment.get("payment_hash") or "").lower()
+                if candidate != payment_hash:
+                    continue
+                return {
+                    "payment_hash": payment_hash,
+                    "status": payment.get("status"),
+                    "value_sats": _as_int(payment.get("value_sat")),
+                    "fee_sats": _as_int(payment.get("fee_sat")),
+                    "creation_time_ns": payment.get("creation_time_ns"),
+                }
+            next_offset = _as_int(result.get("last_index_offset"))
+            if next_offset <= 0 or next_offset == index_offset:
+                break
+            index_offset = next_offset
         return {"payment_hash": payment_hash, "status": "unknown"}
 
     def list_channels(self) -> dict[str, Any]:

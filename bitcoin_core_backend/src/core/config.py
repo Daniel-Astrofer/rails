@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from ipaddress import ip_address
+from pathlib import Path
 from typing import FrozenSet
+from urllib.parse import urlparse
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -99,6 +102,10 @@ class AppConfig:
     rate_limit_per_minute: int
     rate_limit_backend: str
     redis_url: str
+    production: bool = False
+    tls_enabled: bool = False
+    allow_insecure_rpc: bool = False
+    instance_count: int = 1
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -140,12 +147,98 @@ class AppConfig:
             max_send_sats=_int_env("BITCOIN_BACKEND_MAX_SEND_SATS", 10_000_000, 1),
             default_min_confirmations=_int_env("BITCOIN_BACKEND_MIN_CONFIRMATIONS", 1, 0),
             idempotency_ttl_seconds=_int_env("BITCOIN_BACKEND_IDEMPOTENCY_TTL_SECONDS", 24 * 60 * 60, 60),
-            state_db_path=os.getenv("BITCOIN_BACKEND_DB_PATH", "/tmp/kerosene-bitcoin-core-backend.sqlite3"),
+            state_db_path=os.getenv(
+                "BITCOIN_BACKEND_DB_PATH",
+                "/var/lib/kerosene/bitcoin-core-backend/state.sqlite3",
+            ),
             rate_limit_per_minute=_int_env("BITCOIN_BACKEND_RATE_LIMIT_PER_MINUTE", 120, 1),
             rate_limit_backend=os.getenv("BITCOIN_BACKEND_RATE_LIMIT_BACKEND", "memory").lower(),
             redis_url=os.getenv("BITCOIN_BACKEND_REDIS_URL", ""),
+            production=_bool_env("BITCOIN_BACKEND_PRODUCTION", False),
+            tls_enabled=_bool_env("BITCOIN_BACKEND_TLS_ENABLED", False),
+            allow_insecure_rpc=_bool_env("BITCOIN_RPC_ALLOW_INSECURE", False),
+            instance_count=_int_env("BITCOIN_BACKEND_INSTANCE_COUNT", 1, 1),
         )
 
     @property
     def rpc_timeout(self) -> tuple[float, float]:
         return (self.connect_timeout_seconds, self.read_timeout_seconds)
+
+    def validate(self, bind_host: str) -> None:
+        host = (bind_host or "").strip().lower()
+        externally_bound = not _is_loopback_host(host)
+        production = self.production or externally_bound
+
+        if self.rate_limit_backend not in {"memory", "redis"}:
+            raise ValueError("BITCOIN_BACKEND_RATE_LIMIT_BACKEND must be 'memory' or 'redis'")
+        if self.rate_limit_backend == "redis" and not self.redis_url:
+            raise ValueError(
+                "BITCOIN_BACKEND_REDIS_URL is required when BITCOIN_BACKEND_RATE_LIMIT_BACKEND=redis"
+            )
+        if self.auth_disabled and production:
+            raise ValueError("Bitcoin backend authentication cannot be disabled in production")
+        if externally_bound and not self.tls_enabled:
+            raise ValueError(
+                "BITCOIN_BACKEND_TLS_ENABLED=true is required when binding to a non-loopback address"
+            )
+        if not production:
+            return
+
+        if not self.read_api_keys or not self.write_api_keys:
+            raise ValueError("Scoped read and write API keys are required in production")
+        if not self.rpc_user.strip() or not self.rpc_password:
+            raise ValueError("BITCOIN_RPC_USER and BITCOIN_RPC_PASSWORD are required in production")
+        self._validate_rpc_transport()
+        self._validate_state_store()
+
+    def _validate_rpc_transport(self) -> None:
+        parsed = urlparse(self.rpc_url)
+        if parsed.scheme == "https":
+            return
+        if parsed.scheme != "http":
+            raise ValueError("BITCOIN_RPC_URL must use https in production")
+        if not self.allow_insecure_rpc:
+            raise ValueError(
+                "Plain HTTP Bitcoin RPC is disabled in production; terminate TLS/mTLS at the RPC boundary "
+                "or explicitly set BITCOIN_RPC_ALLOW_INSECURE=true for an isolated private network"
+            )
+        if not _is_private_rpc_host(parsed.hostname or ""):
+            raise ValueError(
+                "BITCOIN_RPC_ALLOW_INSECURE=true is only permitted for loopback, RFC1918, or private service hosts"
+            )
+
+    def _validate_state_store(self) -> None:
+        path = Path(self.state_db_path).expanduser()
+        if not path.is_absolute():
+            raise ValueError("BITCOIN_BACKEND_DB_PATH must be an absolute persistent path in production")
+        resolved = path.resolve(strict=False)
+        ephemeral_roots = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
+        if any(resolved == root or root in resolved.parents for root in ephemeral_roots):
+            raise ValueError("BITCOIN_BACKEND_DB_PATH cannot use ephemeral storage in production")
+        if self.instance_count != 1:
+            raise ValueError(
+                "The SQLite idempotency store requires BITCOIN_BACKEND_INSTANCE_COUNT=1; "
+                "run a single replica with a persistent volume"
+            )
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized in {"localhost", "ip6-localhost"}:
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_private_rpc_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if _is_loopback_host(normalized):
+        return True
+    try:
+        address = ip_address(normalized)
+        return address.is_private
+    except ValueError:
+        # Unqualified names and cluster-local DNS names are explicit private service endpoints.
+        return "." not in normalized or normalized.endswith((".internal", ".local", ".svc", ".svc.cluster.local"))

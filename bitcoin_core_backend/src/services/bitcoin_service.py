@@ -141,32 +141,28 @@ class BitcoinBackendService:
         idempotency_key: str | None,
         request_hash: str,
     ) -> dict[str, Any]:
-        wallet = validate_wallet_name(wallet_name)
-        outputs = normalize_outputs(body, self._config.max_outputs_per_tx, self._config.max_send_sats)
-        self._validate_outputs_on_core(outputs)
-
-        options = self._funding_options(body)
-        core_outputs = [{item["address"]: sats_to_btc_string(item["amountSats"])} for item in outputs]
-        result = self._rpc.call("walletcreatefundedpsbt", [[], core_outputs, 0, options, True], wallet=wallet)
-        fee_sats = btc_to_sats(result.get("fee", 0))
-        total_sats = sum(item["amountSats"] for item in outputs)
+        funded = self._fund_psbt(wallet_name, body, lock_unspents=False)
         record_id = self._store.record_transaction(
-            wallet=wallet,
+            wallet=funded["wallet"],
             kind="psbt",
             request_hash=request_hash,
             idempotency_key=idempotency_key,
-            outputs=outputs,
-            psbt=result.get("psbt"),
+            outputs=funded["outputs"],
+            psbt=funded["psbt"],
             status="created",
-            metadata={"feeSats": fee_sats, "changePosition": result.get("changepos")},
+            metadata={
+                "feeSats": funded["feeSats"],
+                "changePosition": funded["changePosition"],
+            },
+            network=self._config.chain,
         )
         return {
             "recordId": record_id,
-            "wallet": wallet,
-            "psbt": result.get("psbt"),
-            "feeSats": fee_sats,
-            "totalOutputSats": total_sats,
-            "changePosition": result.get("changepos"),
+            "wallet": funded["wallet"],
+            "psbt": funded["psbt"],
+            "feeSats": funded["feeSats"],
+            "totalOutputSats": funded["totalOutputSats"],
+            "changePosition": funded["changePosition"],
             "complete": False,
         }
 
@@ -177,6 +173,7 @@ class BitcoinBackendService:
         *,
         idempotency_key: str | None,
         request_hash: str,
+        claim_token: str | None,
     ) -> dict[str, Any]:
         if not self._config.allow_broadcast:
             raise ApiError(
@@ -184,54 +181,100 @@ class BitcoinBackendService:
                 "BROADCAST_DISABLED",
                 "Broadcasting is disabled. Set BITCOIN_BACKEND_ALLOW_BROADCAST=true to enable it.",
             )
-        if not idempotency_key:
+        if not idempotency_key or not claim_token:
             raise ApiError(428, "IDEMPOTENCY_REQUIRED", "Idempotency-Key is required for broadcast requests.")
         if body.get("confirmBroadcast") is not True:
             raise ApiError(400, "BROADCAST_CONFIRMATION_REQUIRED", "confirmBroadcast must be true.")
 
-        psbt_response = self.create_psbt(
-            wallet_name,
-            body,
-            idempotency_key=idempotency_key,
-            request_hash=request_hash,
-        )
-        wallet = psbt_response["wallet"]
-        processed = self._rpc.call("walletprocesspsbt", [psbt_response["psbt"], True, "ALL", False], wallet=wallet)
-        finalized = self._rpc.call("finalizepsbt", [processed.get("psbt"), True])
-        if not finalized.get("complete") or not finalized.get("hex"):
-            raise ApiError(409, "PSBT_NOT_FINAL", "Bitcoin Core could not finalize the PSBT.")
+        prepared = self._store.load_prepared_broadcast(idempotency_key, request_hash)
+        if prepared is None:
+            funded = self._fund_psbt(wallet_name, body, lock_unspents=True)
+            try:
+                processed = self._rpc.call(
+                    "walletprocesspsbt",
+                    [funded["psbt"], True, "ALL", False],
+                    wallet=funded["wallet"],
+                )
+                finalized = self._rpc.call("finalizepsbt", [processed.get("psbt"), True])
+                if not finalized.get("complete") or not finalized.get("hex"):
+                    raise ApiError(409, "PSBT_NOT_FINAL", "Bitcoin Core could not finalize the PSBT.")
+                raw_tx = str(finalized["hex"])
+                decoded = self._rpc.call("decoderawtransaction", [raw_tx])
+                expected_txid = validate_txid(decoded.get("txid") if isinstance(decoded, dict) else None)
+                prepared = self._store.save_prepared_broadcast(
+                    key=idempotency_key,
+                    claim_token=claim_token,
+                    request_hash=request_hash,
+                    wallet=funded["wallet"],
+                    outputs=funded["outputs"],
+                    psbt=str(processed.get("psbt") or funded["psbt"]),
+                    raw_tx=raw_tx,
+                    expected_txid=expected_txid,
+                    fee_sats=funded["feeSats"],
+                    total_output_sats=funded["totalOutputSats"],
+                    network=self._config.chain,
+                )
+            except Exception:
+                self._unlock_psbt_inputs(funded["wallet"], funded["psbt"])
+                raise
 
-        raw_tx = finalized["hex"]
-        mempool = self._rpc.call("testmempoolaccept", [[raw_tx]])
+        self._require_claim_heartbeat(idempotency_key, claim_token)
+        if self._transaction_known(prepared.wallet, prepared.expected_txid):
+            self._store.mark_broadcast(idempotency_key, claim_token, prepared.expected_txid)
+            return self._broadcast_result(prepared)
+
+        mempool = self._rpc.call("testmempoolaccept", [[prepared.raw_tx]])
         first = mempool[0] if mempool else {}
         if not first.get("allowed"):
+            if self._transaction_known(prepared.wallet, prepared.expected_txid):
+                self._store.mark_broadcast(idempotency_key, claim_token, prepared.expected_txid)
+                return self._broadcast_result(prepared)
+            self._store.mark_prepared_failed(
+                idempotency_key,
+                claim_token,
+                409,
+                "MEMPOOL_REJECTED",
+                "Bitcoin Core rejected the prepared transaction.",
+            )
+            self._unlock_psbt_inputs(prepared.wallet, prepared.psbt)
             raise ApiError(
                 409,
                 "MEMPOOL_REJECTED",
                 "Bitcoin Core rejected the transaction.",
                 {"rejectReason": first.get("reject-reason")},
             )
-        txid = self._rpc.call("sendrawtransaction", [raw_tx])
-        record_id = self._store.record_transaction(
-            wallet=wallet,
-            kind="broadcast",
-            request_hash=request_hash,
-            idempotency_key=idempotency_key,
-            outputs=normalize_outputs(body, self._config.max_outputs_per_tx, self._config.max_send_sats),
-            psbt=processed.get("psbt"),
-            raw_tx=raw_tx,
-            txid=txid,
-            status="broadcast",
-            metadata={"mempoolAllowed": True, "feeSats": psbt_response.get("feeSats")},
-        )
-        return {
-            "recordId": record_id,
-            "wallet": wallet,
-            "txid": txid,
-            "feeSats": psbt_response.get("feeSats"),
-            "totalOutputSats": psbt_response.get("totalOutputSats"),
-            "mempoolAccepted": True,
-        }
+        try:
+            returned_txid = validate_txid(self._rpc.call("sendrawtransaction", [prepared.raw_tx]))
+        except RpcError as error:
+            if self._transaction_known(prepared.wallet, prepared.expected_txid):
+                returned_txid = prepared.expected_txid
+            else:
+                self._store.mark_unknown(
+                    idempotency_key,
+                    claim_token,
+                    prepared.expected_txid,
+                    str(error),
+                )
+                raise ApiError(
+                    503 if error.status_code < 500 else error.status_code,
+                    "BROADCAST_RESULT_UNKNOWN",
+                    "Bitcoin broadcast result is unknown; the exact prepared transaction will be reconciled before retry.",
+                    {"txid": prepared.expected_txid},
+                ) from error
+        if returned_txid != prepared.expected_txid:
+            self._store.mark_unknown(
+                idempotency_key,
+                claim_token,
+                prepared.expected_txid,
+                "Bitcoin Core returned a different txid",
+            )
+            raise ApiError(
+                502,
+                "BROADCAST_TXID_MISMATCH",
+                "Bitcoin Core returned a txid different from the persisted transaction.",
+            )
+        self._store.mark_broadcast(idempotency_key, claim_token, returned_txid)
+        return self._broadcast_result(prepared)
 
     def wallet_transaction(self, wallet_name: str, txid_value: str) -> dict[str, Any]:
         wallet = validate_wallet_name(wallet_name)
@@ -276,6 +319,90 @@ class BitcoinBackendService:
             "recentTransactions": recent,
         }
 
+    def _fund_psbt(
+        self,
+        wallet_name: str,
+        body: dict[str, Any],
+        *,
+        lock_unspents: bool,
+    ) -> dict[str, Any]:
+        wallet = validate_wallet_name(wallet_name)
+        outputs = normalize_outputs(body, self._config.max_outputs_per_tx, self._config.max_send_sats)
+        self._validate_outputs_on_core(outputs)
+        options = self._funding_options(body, lock_unspents=lock_unspents)
+        core_outputs = [
+            {item["address"]: sats_to_btc_string(item["amountSats"])}
+            for item in outputs
+        ]
+        result = self._rpc.call(
+            "walletcreatefundedpsbt",
+            [[], core_outputs, 0, options, True],
+            wallet=wallet,
+        )
+        psbt = result.get("psbt") if isinstance(result, dict) else None
+        if not psbt:
+            raise ApiError(502, "PSBT_MISSING", "Bitcoin Core did not return a funded PSBT.")
+        return {
+            "wallet": wallet,
+            "outputs": outputs,
+            "psbt": str(psbt),
+            "feeSats": btc_to_sats(result.get("fee", 0)),
+            "totalOutputSats": sum(item["amountSats"] for item in outputs),
+            "changePosition": result.get("changepos"),
+        }
+
+    def _transaction_known(self, wallet: str, txid: str) -> bool:
+        try:
+            self._rpc.call("getmempoolentry", [txid])
+            return True
+        except RpcError:
+            pass
+        try:
+            self._rpc.call("gettransaction", [txid, True, True], wallet=wallet)
+            return True
+        except RpcError:
+            return False
+
+    def _require_claim_heartbeat(self, key: str, claim_token: str) -> None:
+        if not self._store.heartbeat_claim(key, claim_token):
+            raise ApiError(
+                409,
+                "IDEMPOTENCY_CLAIM_LOST",
+                "This worker no longer owns the broadcast claim.",
+            )
+
+    @staticmethod
+    def _broadcast_result(prepared) -> dict[str, Any]:
+        return {
+            "recordId": prepared.record_id,
+            "wallet": prepared.wallet,
+            "txid": prepared.expected_txid,
+            "feeSats": prepared.fee_sats,
+            "totalOutputSats": prepared.total_output_sats,
+            "mempoolAccepted": True,
+        }
+
+    def _unlock_psbt_inputs(self, wallet: str, psbt: str) -> None:
+        try:
+            decoded = self._rpc.call("decodepsbt", [psbt])
+            vin = decoded.path("tx").path("vin") if hasattr(decoded, "path") else None
+            if vin is None and isinstance(decoded, dict):
+                vin = (decoded.get("tx") or {}).get("vin")
+            if not isinstance(vin, list):
+                return
+            inputs = [
+                {"txid": item.get("txid"), "vout": item.get("vout")}
+                for item in vin
+                if isinstance(item, dict)
+                and item.get("txid")
+                and isinstance(item.get("vout"), int)
+            ]
+            if inputs:
+                self._rpc.call("lockunspent", [True, inputs], wallet=wallet)
+        except Exception:
+            # Best effort only. The persisted prepared transaction remains the source of truth.
+            return
+
     def _validate_outputs_on_core(self, outputs: list[dict[str, Any]]) -> None:
         for item in outputs:
             address = validate_address_literal(item["address"])
@@ -283,7 +410,7 @@ class BitcoinBackendService:
             if not result.get("isvalid"):
                 raise ApiError(400, "INVALID_BITCOIN_ADDRESS", "Bitcoin Core rejected an output address.")
 
-    def _funding_options(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _funding_options(self, body: dict[str, Any], *, lock_unspents: bool) -> dict[str, Any]:
         conf_target = parse_non_negative_int(body.get("confTarget"), "confTarget", 6, 1008)
         if conf_target == 0:
             conf_target = 6
@@ -301,7 +428,7 @@ class BitcoinBackendService:
             "conf_target": conf_target,
             "estimate_mode": estimate_mode,
             "replaceable": bool(body.get("replaceable", True)),
-            "lockUnspents": bool(body.get("lockUnspents", False)),
+            "lockUnspents": lock_unspents or bool(body.get("lockUnspents", False)),
             "subtractFeeFromOutputs": subtract,
             "change_type": str(body.get("changeType") or "bech32"),
         }

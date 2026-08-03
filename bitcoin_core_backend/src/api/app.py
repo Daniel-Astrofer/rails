@@ -15,11 +15,14 @@ from src.core.config import AppConfig
 from src.core.errors import ApiError, RpcError, rpc_error_to_api_error
 from src.infra.rpc import BitcoinRPCClient
 from src.services.bitcoin_service import BitcoinBackendService, fingerprint_for_request
-from src.infra.store import CohesionStore
+from src.infra.store import CohesionStore, IdempotencyClaim, IdempotencyReplay
 from src.core.validation import validate_idempotency_key, validate_wallet_name
 
 
-JsonHandler = Callable[[dict[str, Any], str | None, str], tuple[dict[str, Any], int] | dict[str, Any]]
+JsonHandler = Callable[
+    [dict[str, Any], str | None, str, str | None, str | None],
+    tuple[dict[str, Any], int] | dict[str, Any],
+]
 
 
 class FixedWindowLimiter:
@@ -44,9 +47,10 @@ class FixedWindowLimiter:
 class RedisRateLimiter:
     """Redis-backed distributed rate limiter for multi-worker deployments."""
 
-    def __init__(self, redis_url: str, limit_per_minute: int):
+    def __init__(self, redis_url: str, limit_per_minute: int, *, fail_open: bool):
         self._redis_url = redis_url
         self._limit = max(1, int(limit_per_minute))
+        self._fail_open = fail_open
         self._redis: Any = None
 
     def _ensure_redis(self) -> Any:
@@ -63,7 +67,7 @@ class RedisRateLimiter:
     def allow(self, key: str) -> bool:
         r = self._ensure_redis()
         if r is False:
-            return True
+            return self._fail_open
         try:
             redis_key = f"ratelimit:bitcoin:{key}:60"
             count = r.incr(redis_key)
@@ -71,7 +75,7 @@ class RedisRateLimiter:
                 r.expire(redis_key, 60)
             return count <= self._limit
         except Exception:
-            return True
+            return self._fail_open
 
 
 def create_app(config: AppConfig | None = None) -> Flask:
@@ -79,24 +83,20 @@ def create_app(config: AppConfig | None = None) -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = cfg.max_content_length
 
-    # ITEM 25: Prohibit disabled auth in production or non-loopback
     host = os.getenv("HOST", "127.0.0.1").strip()
+    cfg.validate(host)
     if cfg.auth_disabled:
-        if os.getenv("BITCOIN_BACKEND_PRODUCTION", "").strip().lower() in {"1", "true", "yes", "on"}:
-            raise RuntimeError("BITCOIN_BACKEND_AUTH_DISABLED=true is not allowed in production (set BITCOIN_BACKEND_PRODUCTION=true)")
-        if host not in {"127.0.0.1", "localhost", "::1"}:
-            raise RuntimeError("Auth cannot be disabled when binding to non-loopback address")
         app.logger.warning("AUTH DISABLED — running in dev mode. Do NOT use in production.")
-
-    # ITEM 28: Enforce TLS for non-loopback
-    if host not in {"127.0.0.1", "localhost", "::1"} and not os.getenv("BITCOIN_BACKEND_TLS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
-        raise RuntimeError("HTTPS/TLS required when binding to non-loopback. Set BITCOIN_BACKEND_TLS_ENABLED=true.")
 
     rpc = BitcoinRPCClient(cfg)
     store = CohesionStore(cfg.state_db_path, cfg.idempotency_ttl_seconds)
     service = BitcoinBackendService(cfg, rpc, store)
     if cfg.rate_limit_backend == "redis" and cfg.redis_url:
-        limiter: FixedWindowLimiter | RedisRateLimiter = RedisRateLimiter(cfg.redis_url, cfg.rate_limit_per_minute)
+        limiter: FixedWindowLimiter | RedisRateLimiter = RedisRateLimiter(
+            cfg.redis_url,
+            cfg.rate_limit_per_minute,
+            fail_open=not cfg.production,
+        )
     else:
         limiter = FixedWindowLimiter(cfg.rate_limit_per_minute)
 
@@ -183,7 +183,7 @@ def create_app(config: AppConfig | None = None) -> Flask:
 
     @app.post("/v1/wallets")
     def open_wallet() -> Response:
-        return _json_post(store, cfg, lambda body, idem, req_hash: service.open_wallet(body))
+        return _json_post(store, cfg, lambda body, idem, req_hash, storage_key, token: service.open_wallet(body))
 
     @app.get("/v1/wallets/<wallet>/balance")
     def wallet_balance(wallet: str) -> Response:
@@ -192,7 +192,11 @@ def create_app(config: AppConfig | None = None) -> Flask:
     @app.post("/v1/wallets/<wallet>/addresses")
     def new_address(wallet: str) -> Response:
         validate_wallet_name(wallet)
-        return _json_post(store, cfg, lambda body, idem, req_hash: service.new_address(wallet, body))
+        return _json_post(
+            store,
+            cfg,
+            lambda body, idem, req_hash, storage_key, token: service.new_address(wallet, body),
+        )
 
     @app.get("/v1/wallets/<wallet>/utxos")
     def list_utxos(wallet: str) -> Response:
@@ -204,10 +208,10 @@ def create_app(config: AppConfig | None = None) -> Flask:
         return _json_post(
             store,
             cfg,
-            lambda body, idem, req_hash: service.create_psbt(
+            lambda body, idem, req_hash, storage_key, token: service.create_psbt(
                 wallet,
                 body,
-                idempotency_key=idem,
+                idempotency_key=storage_key or idem,
                 request_hash=req_hash,
             ),
         )
@@ -218,11 +222,12 @@ def create_app(config: AppConfig | None = None) -> Flask:
         return _json_post(
             store,
             cfg,
-            lambda body, idem, req_hash: service.create_sign_and_send(
+            lambda body, idem, req_hash, storage_key, token: service.create_sign_and_send(
                 wallet,
                 body,
-                idempotency_key=idem,
+                idempotency_key=storage_key,
                 request_hash=req_hash,
+                claim_token=token,
             ),
             require_idempotency=True,
         )
@@ -300,23 +305,39 @@ def _json_post(
     scope = f"{request.method}:{request.path}"
 
     # ITEM 3: Atomic idempotency claim using INSERT OR IGNORE
+    claim: IdempotencyClaim | None = None
     if namespaced:
-        replay = store.claim_idempotent(namespaced, scope, request_hash)
-        if replay:
-            status, cached = replay
+        outcome = store.claim_idempotent(namespaced, scope, request_hash)
+        if isinstance(outcome, IdempotencyReplay):
+            status = outcome.status_code
+            cached = outcome.response
             cached["requestId"] = g.get("request_id")
             cached["idempotentReplay"] = True
             return jsonify(cached), status
+        claim = outcome
 
-    result = handler(body, idempotency_key, request_hash)
+    result = handler(
+        body,
+        idempotency_key,
+        request_hash,
+        namespaced or None,
+        claim.token if claim else None,
+    )
     status_code = 200
     if isinstance(result, tuple):
         payload, status_code = result
     else:
         payload = result
     response_body = _ok(payload)
-    if namespaced and 200 <= status_code < 300:
-        store.store_response(namespaced, scope, request_hash, status_code, response_body)
+    if namespaced and claim and 200 <= status_code < 300:
+        store.store_response(
+            namespaced,
+            scope,
+            request_hash,
+            claim.token,
+            status_code,
+            response_body,
+        )
     return jsonify(response_body), status_code
 
 

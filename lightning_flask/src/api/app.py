@@ -7,7 +7,7 @@ from typing import Any
 
 from flask import Flask, g, jsonify, request
 
-from src.infra.cohesion import CohesionStore
+from src.infra.cohesion import CohesionStore, IdempotencyClaim, IdempotencyReplay
 from src.core.config import Settings
 from src.infra.lnd import LndClient
 from src.core.security import (
@@ -42,7 +42,8 @@ class IdempotentReplay(Exception):
 
 def create_app(settings: Settings | None = None, lnd_client: LndClient | None = None) -> Flask:
     settings = settings or Settings.from_env()
-    settings.validate()
+    host = os.getenv("HOST", "127.0.0.1").strip()
+    settings.validate(host)
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = settings.max_body_bytes
@@ -50,7 +51,11 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
 
     store = CohesionStore(settings.sqlite_path)
     if settings.rate_limit_backend == "redis" and settings.redis_url:
-        limiter: RateLimiter | RedisRateLimiter = RedisRateLimiter(settings.redis_url, settings.rate_limit_per_minute)
+        limiter: RateLimiter | RedisRateLimiter = RedisRateLimiter(
+            settings.redis_url,
+            settings.rate_limit_per_minute,
+            fail_open=not settings.production,
+        )
     else:
         limiter = RateLimiter(settings.rate_limit_per_minute)
     client = lnd_client or LndClient(settings)
@@ -58,18 +63,8 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
     # ITEM 27: Validate LND network at startup
     _validate_lnd_network(client, settings)
 
-    # ITEM 25: Startup auth/bind checks
-    host = os.getenv("HOST", "127.0.0.1").strip()
     if settings.auth_disabled:
-        if settings.production:
-            raise RuntimeError("LIGHTNING_AUTH_DISABLED=true is not allowed in production")
-        if host not in {"127.0.0.1", "localhost", "::1"}:
-            raise RuntimeError("Auth cannot be disabled when binding to non-loopback address")
         logger.warning("AUTH DISABLED — running in dev mode. Do NOT use in production.")
-
-    # ITEM 28: Enforce TLS for non-loopback
-    if host not in {"127.0.0.1", "localhost", "::1"} and not os.getenv("LIGHTNING_TLS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
-        raise RuntimeError("HTTPS/TLS required when binding to non-loopback. Set LIGHTNING_TLS_ENABLED=true.")
 
     @app.before_request
     def authenticate_and_prepare():
@@ -91,6 +86,8 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
         limiter.check(principal + ":" + str(request.remote_addr))
         g.fingerprint = request_fingerprint(request)
         g.idempotency_key = ""
+        g.idempotency_claim_token = ""
+        g.idempotency_claim_state = ""
         if request.method in {"POST", "PUT", "PATCH"}:
             content_type = request.content_type or ""
             if not content_type.startswith("application/json"):
@@ -105,6 +102,19 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
 
     @app.errorhandler(ApiError)
     def api_error(error: ApiError):
+        key = getattr(g, "idempotency_key", "")
+        claim_token = getattr(g, "idempotency_claim_token", "")
+        if key and claim_token and 400 <= error.status_code < 500:
+            state = store.state(key)
+            if state and state.get("state") == "CLAIMED" and state.get("claim_token") == claim_token:
+                store.mark_failed(
+                    key,
+                    g.fingerprint,
+                    claim_token,
+                    error.code,
+                    error.message,
+                    error.status_code,
+                )
         return _json({"success": False, "error": {"code": error.code, "message": error.message}}, error.status_code)
 
     @app.errorhandler(IdempotentReplay)
@@ -215,7 +225,7 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
             logger.warning("LND payreq decode failed: %s", exc)
             raise ApiError("Failed to decode invoice from LND", 502, "lnd_decode_error")
 
-        payment_hash = decoded.get("payment_hash") or ""
+        payment_hash = validate_payment_hash(decoded.get("payment_hash"))
         invoice_amount_sats = decoded.get("num_satoshis", 0)
         invoice_network = decoded.get("network", "")
         invoice_expiry = decoded.get("expiry", 3600)
@@ -271,10 +281,6 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
 
         timeout_seconds = parse_optional_int(body.get("timeout_seconds"), "timeout_seconds", 60, 1, 600)
 
-        # ── ITEM 2: Idempotency enforcement ──
-
-        # Namespace key: principal_id:idempotency_key
-        # principal_id comes from bearer token tail
         principal_id = g.get("principal_id", "anon")
         raw_key = request.headers.get("Idempotency-Key", "").strip()
         if not raw_key:
@@ -290,41 +296,133 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
         namespaced_key = f"{principal_id}:{validated_key}"
         g.idempotency_key = namespaced_key
 
-        # Check if payment_hash already settled (ITEM 1: duplicate payment guard)
         existing_hash = store.query_payment_by_hash(payment_hash)
-        if existing_hash and existing_hash["state"] in ("SUCCEEDED", "SUBMITTED"):
+        if (
+            existing_hash
+            and existing_hash["key"] != namespaced_key
+            and existing_hash["state"] != "FAILED_FINAL"
+        ):
             raise ApiError(
                 "Invoice has already been paid (duplicate payment_hash)", 409, "payment_hash_already_settled",
             )
 
-        # ITEM 2: Atomic claim CLAIMED with lease
-        cached = store.claim_idempotent(
+        claim = store.claim_idempotent(
             namespaced_key, g.fingerprint,
             payment_hash=payment_hash, network=settings.network,
         )
-        if cached:
-            payload, status = cached
-            raise IdempotentReplay(payload, status)
+        if isinstance(claim, IdempotencyReplay):
+            raise IdempotentReplay(claim.payload, claim.status_code)
+        g.idempotency_claim_token = claim.token
+        g.idempotency_claim_state = claim.state
 
-        # ── ITEM 1 step 6: No LND call before complete validation ✓ ──
-        # All validation above is pure logic + LND decode (read-only), no mutation.
-        # Now call LND pay.
+        if claim.state in {"SUBMITTED", "UNKNOWN"}:
+            try:
+                reconciled = client.lookup_payment(payment_hash)
+            except Exception as exc:
+                store.mark_unknown(
+                    namespaced_key,
+                    g.fingerprint,
+                    claim.token,
+                    payment_hash,
+                    str(exc),
+                )
+                raise ApiError(
+                    "Unable to reconcile the previous Lightning payment attempt",
+                    503,
+                    "payment_reconciliation_unavailable",
+                ) from exc
+            reconciliation_state = _payment_state(reconciled)
+            if reconciliation_state == "SUCCEEDED":
+                response_payload = {"success": True, "payment": reconciled}
+                store.append_event(
+                    "payment_reconciled",
+                    payment_hash=payment_hash,
+                    amount_sats=amount_sats,
+                    status="succeeded",
+                    metadata={"source": "idempotency_retry"},
+                    idempotency_key=namespaced_key,
+                )
+                return _idempotent(store, response_payload, 202)
+            if reconciliation_state == "FAILED":
+                store.mark_failed(
+                    namespaced_key,
+                    g.fingerprint,
+                    claim.token,
+                    "payment_failed",
+                    "LND reports that the previous payment failed",
+                    409,
+                )
+                raise ApiError("Lightning payment failed", 409, "payment_failed")
+            store.mark_unknown(
+                namespaced_key,
+                g.fingerprint,
+                claim.token,
+                payment_hash,
+                "LND payment is still in flight or unknown",
+            )
+            raise ApiError(
+                "Previous payment is still in flight or unknown; no second payment was submitted",
+                409,
+                "payment_reconciliation_pending",
+            )
 
+        store.mark_submitted(namespaced_key, g.fingerprint, claim.token, payment_hash)
         try:
-            store.mark_submitted(namespaced_key, g.fingerprint, payment_hash)
             result = client.pay_invoice(
                 payment_request, fee_limit_sats, timeout_seconds,
                 amount_sats=amount_sats if invoice_amount_sats == 0 else None,
             )
-        except ApiError:
-            store.mark_failed(namespaced_key, g.fingerprint, "payment_rejected", "LND rejected payment")
-            raise
         except Exception as exc:
             logger.error("LND payment timeout or network error: %s", exc)
-            store.mark_unknown(namespaced_key, g.fingerprint, payment_hash)
+            store.mark_unknown(
+                namespaced_key,
+                g.fingerprint,
+                claim.token,
+                payment_hash,
+                str(exc),
+            )
             raise ApiError(
-                "Payment timed out — result unknown. Reconcile before retrying.",
+                "Payment result is unknown. Reconcile before retrying.",
                 504, "payment_timeout_unknown",
+            ) from exc
+
+        returned_hash = str(result.get("payment_hash") or "").lower()
+        if returned_hash and returned_hash != payment_hash.lower():
+            store.mark_unknown(
+                namespaced_key,
+                g.fingerprint,
+                claim.token,
+                payment_hash,
+                "LND returned a different payment hash",
+            )
+            raise ApiError(
+                "LND returned a payment hash different from the decoded invoice",
+                502,
+                "payment_hash_mismatch",
+            )
+        provider_state = _payment_state(result)
+        if result.get("payment_error") or provider_state == "FAILED":
+            store.mark_failed(
+                namespaced_key,
+                g.fingerprint,
+                claim.token,
+                "payment_rejected",
+                "LND rejected the payment",
+                409,
+            )
+            raise ApiError("LND rejected the payment", 409, "payment_rejected")
+        if provider_state == "UNKNOWN":
+            store.mark_unknown(
+                namespaced_key,
+                g.fingerprint,
+                claim.token,
+                payment_hash,
+                "LND returned an unknown payment state",
+            )
+            raise ApiError(
+                "Payment result is unknown. Reconcile before retrying.",
+                504,
+                "payment_timeout_unknown",
             )
 
         store.append_event(
@@ -380,14 +478,16 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
         namespaced = f"{principal_id}:{validated}"
         g.idempotency_key = namespaced
         cached = store.claim_idempotent(namespaced, g.fingerprint)
-        if cached:
-            payload, status = cached
-            raise IdempotentReplay(payload, status)
+        if isinstance(cached, IdempotencyReplay):
+            raise IdempotentReplay(cached.payload, cached.status_code)
+        g.idempotency_claim_token = cached.token
+        g.idempotency_claim_state = cached.state
 
     def _idempotent(store: CohesionStore, payload: dict[str, Any], status_code: int):
         key = getattr(g, "idempotency_key", "")
-        if key:
-            store.save_idempotent(key, g.fingerprint, payload, status_code)
+        claim_token = getattr(g, "idempotency_claim_token", "")
+        if key and claim_token:
+            store.save_idempotent(key, g.fingerprint, claim_token, payload, status_code)
         return _json(payload, status_code)
 
     return app
@@ -395,6 +495,17 @@ def create_app(settings: Settings | None = None, lnd_client: LndClient | None = 
 
 def _json(payload: dict[str, Any], status_code: int = 200):
     return jsonify(payload), status_code
+
+
+def _payment_state(payment: dict[str, Any] | None) -> str:
+    status = str((payment or {}).get("status") or "").strip().upper()
+    if status in {"SUCCEEDED", "SETTLED", "COMPLETED", "COMPLETE"}:
+        return "SUCCEEDED"
+    if status in {"FAILED", "FAILURE", "CANCELED", "CANCELLED"}:
+        return "FAILED"
+    if status in {"IN_FLIGHT", "INITIATED", "PENDING", "SUBMITTED"}:
+        return "IN_FLIGHT"
+    return "UNKNOWN"
 
 
 def _validate_lnd_network(client: LndClient, settings: Settings) -> None:
@@ -415,10 +526,16 @@ def _validate_lnd_network(client: LndClient, settings: Settings) -> None:
                 "Refusing to start to prevent cross-network financial operations."
             )
         logger.info("LND network validated: %s (configured: %s)", lnd_network or "unknown", settings.network)
-    except ApiError:
+    except RuntimeError:
         raise
+    except ApiError as exc:
+        if settings.production:
+            raise RuntimeError("Unable to validate the LND network in production") from exc
+        logger.warning("Could not validate LND network at startup: %s", exc)
     except Exception as exc:
-        logger.warning("Could not validate LND network at startup: %s — continuing", exc)
+        if settings.production:
+            raise RuntimeError("Unable to validate the LND network in production") from exc
+        logger.warning("Could not validate LND network at startup: %s", exc)
 
 
 if __name__ == "__main__":

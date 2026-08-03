@@ -2,22 +2,52 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 import json
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
+import uuid
 
 from src.core.errors import ApiError
 
 
+@dataclass(frozen=True)
+class IdempotencyReplay:
+    status_code: int
+    response: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class IdempotencyClaim:
+    key: str
+    token: str
+    state: str
+    prepared_record_id: int | None
+
+
+@dataclass(frozen=True)
+class PreparedBroadcast:
+    record_id: int
+    wallet: str
+    request_hash: str
+    outputs: list[dict[str, Any]]
+    psbt: str
+    raw_tx: str
+    expected_txid: str
+    fee_sats: int
+    total_output_sats: int
+
+
 class CohesionStore:
-    def __init__(self, path: str, idempotency_ttl_seconds: int) -> None:
+    def __init__(self, path: str, idempotency_ttl_seconds: int, claim_lease_seconds: int = 300) -> None:
         self._path = path
         self._ttl = idempotency_ttl_seconds
+        self._claim_lease_seconds = max(5, int(claim_lease_seconds))
         self._lock = threading.RLock()
-        self._claim_tokens: dict[str, str] = {}
         self._ensure_parent()
         self._init_db()
 
@@ -26,7 +56,7 @@ class CohesionStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT scope, request_hash, status_code, response_json
+                SELECT scope, request_hash, status_code, response_json, state
                 FROM idempotency_records
                 WHERE key = ? AND expires_at > ?
                 """,
@@ -40,192 +70,455 @@ class CohesionStore:
                 "IDEMPOTENCY_KEY_REUSED",
                 "Idempotency-Key was already used for a different request.",
             )
+        if row["state"] not in {"SUCCEEDED", "FAILED_FINAL"}:
+            return None
         return int(row["status_code"]), json.loads(row["response_json"])
 
-    def claim_idempotent(self, key: str, scope: str, request_hash: str) -> tuple[int, dict[str, Any]] | None:
-        """ITEM 3: Atomic idempotency claim using INSERT OR IGNORE inside BEGIN IMMEDIATE.
-        First process gets CLAIMED ownership with lease, others get replay or 409.
-        Uses claim_token UUID for ownership verification.
-        Returns cached response if key was already completed, or None if claim succeeded."""
-        import uuid
+    def claim_idempotent(
+        self,
+        key: str,
+        scope: str,
+        request_hash: str,
+    ) -> IdempotencyClaim | IdempotencyReplay:
+        """Atomically claims an idempotency key and fences every previous owner."""
         now = int(time.time())
-        lease_seconds = 300
         claim_token = str(uuid.uuid4())
-
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                cursor = conn.execute(
+                row = conn.execute(
                     """
-                    INSERT OR IGNORE INTO idempotency_records(
-                        key, scope, request_hash, status_code, response_json,
-                        created_at, expires_at, claim_token, claimed_at, lease_expires_at, state
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    SELECT scope, request_hash, status_code, response_json, state,
+                           claim_token, lease_expires_at, expires_at, prepared_record_id
+                    FROM idempotency_records
+                    WHERE key = ?
                     """,
-                    (key, scope, request_hash, -1, "{}", now, now + self._ttl,
-                     claim_token, now, now + lease_seconds, "CLAIMED"),
-                )
-                inserted = cursor.rowcount == 1
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+                    (key,),
+                ).fetchone()
 
-            row = conn.execute(
-                """SELECT scope, request_hash, status_code, response_json, claim_token, state,
-                   lease_expires_at FROM idempotency_records WHERE key = ?""",
-                (key,),
-            ).fetchone()
+                if row is not None and int(row["expires_at"]) <= now:
+                    conn.execute("DELETE FROM idempotency_records WHERE key = ?", (key,))
+                    row = None
 
-        if row is None:
-            return None
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO idempotency_records(
+                            key, scope, request_hash, status_code, response_json,
+                            created_at, expires_at, claim_token, claimed_at,
+                            lease_expires_at, state
+                        )
+                        VALUES(?, ?, ?, -1, '{}', ?, ?, ?, ?, ?, 'CLAIMED')
+                        """,
+                        (
+                            key,
+                            scope,
+                            request_hash,
+                            now,
+                            now + self._ttl,
+                            claim_token,
+                            now,
+                            now + self._claim_lease_seconds,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                    return IdempotencyClaim(key, claim_token, "CLAIMED", None)
 
-        # Verify same scope/request_hash
-        if row["scope"] != scope or row["request_hash"] != request_hash:
-            raise ApiError(
-                409,
-                "IDEMPOTENCY_KEY_REUSED",
-                "Idempotency-Key was already used for a different request.",
-            )
+                if row["scope"] != scope or row["request_hash"] != request_hash:
+                    raise ApiError(
+                        409,
+                        "IDEMPOTENCY_KEY_REUSED",
+                        "Idempotency-Key was already used for a different request.",
+                    )
 
-        state = row["state"]
-        status_code = int(row["status_code"])
+                state = str(row["state"])
+                if state in {"SUCCEEDED", "FAILED_FINAL"}:
+                    conn.execute("COMMIT")
+                    return IdempotencyReplay(
+                        int(row["status_code"]),
+                        json.loads(row["response_json"]),
+                    )
 
-        if state in ("SUCCEEDED", "FAILED_FINAL"):
-            return status_code, json.loads(row["response_json"])
-
-        if state == "CLAIMED":
-            lease_expires = int(row["lease_expires_at"] or 0)
-            if not inserted:
-                if now < lease_expires:
+                lease_expires_at = int(row["lease_expires_at"] or 0)
+                if row["claim_token"] and lease_expires_at > now:
                     raise ApiError(
                         409,
                         "IDEMPOTENCY_IN_PROGRESS",
                         "A request with this Idempotency-Key is still in progress.",
                     )
-                # Stale lease — treat as new claim, update lease
-                new_token = str(uuid.uuid4())
-                with self._lock, self._connect() as conn:
-                    conn.execute(
-                        "UPDATE idempotency_records SET claim_token=?, claimed_at=?, lease_expires_at=?, state='CLAIMED' WHERE key=?",
-                        (new_token, now, now + lease_seconds, key),
-                    )
-                return None
-            # Store claim_token for heartbeat verification
-            self._claim_tokens[key] = claim_token
-            return None
 
-        if state == "BROADCAST":
-            if inserted:
-                return None
-            raise ApiError(
-                409,
-                "IDEMPOTENCY_IN_PROGRESS",
-                "Transaction broadcast is in progress.",
-            )
-
-        if state == "UNKNOWN":
-            return 409, json.loads('{"success":false,"errorCode":"IDEMPOTENCY_UNKNOWN","message":"Previous request result unknown. Reconcile before retrying."}')
-
-        # Fallback: stale claim
-        if status_code == -1:
-            if not inserted and now - int(row["lease_expires_at"] or now) + lease_seconds < 300:
-                raise ApiError(
-                    409,
-                    "IDEMPOTENCY_IN_PROGRESS",
-                    "A request with this Idempotency-Key is still in progress.",
+                updated = conn.execute(
+                    """
+                    UPDATE idempotency_records
+                    SET claim_token = ?, claimed_at = ?, lease_expires_at = ?, expires_at = ?
+                    WHERE key = ?
+                      AND request_hash = ?
+                      AND (claim_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    """,
+                    (
+                        claim_token,
+                        now,
+                        now + self._claim_lease_seconds,
+                        now + self._ttl,
+                        key,
+                        request_hash,
+                        now,
+                    ),
                 )
-            return None
+                if updated.rowcount != 1:
+                    raise ApiError(
+                        409,
+                        "IDEMPOTENCY_IN_PROGRESS",
+                        "A request with this Idempotency-Key is still in progress.",
+                    )
+                conn.execute("COMMIT")
+                prepared_record_id = row["prepared_record_id"]
+                return IdempotencyClaim(
+                    key,
+                    claim_token,
+                    state,
+                    int(prepared_record_id) if prepared_record_id is not None else None,
+                )
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
-        return status_code, json.loads(row["response_json"])
-
-    def store_response(self, key: str, scope: str, request_hash: str, status_code: int, response: dict[str, Any]) -> None:
+    def store_response(
+        self,
+        key: str,
+        scope: str,
+        request_hash: str,
+        claim_token: str,
+        status_code: int,
+        response: dict[str, Any],
+    ) -> None:
         now = int(time.time())
         expires_at = now + self._ttl
         payload = json.dumps(response, sort_keys=True, separators=(",", ":"))
         with self._lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT scope, request_hash, expires_at FROM idempotency_records WHERE key = ?",
-                (key,),
-            ).fetchone()
-            if (
-                row is not None
-                and int(row["expires_at"]) > now
-                and (row["scope"] != scope or row["request_hash"] != request_hash)
-            ):
-                raise ApiError(
-                    409,
-                    "IDEMPOTENCY_KEY_REUSED",
-                    "Idempotency-Key was already used for a different request.",
+            updated = conn.execute(
+                """
+                UPDATE idempotency_records
+                SET status_code = ?, response_json = ?, expires_at = ?, state = 'SUCCEEDED',
+                    settled_at = ?, lease_expires_at = NULL, claim_token = NULL, last_error = NULL
+                WHERE key = ? AND scope = ? AND request_hash = ? AND claim_token = ?
+                  AND state NOT IN ('SUCCEEDED', 'FAILED_FINAL')
+                """,
+                (
+                    int(status_code),
+                    payload,
+                    expires_at,
+                    now,
+                    key,
+                    scope,
+                    request_hash,
+                    claim_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise self._lost_claim()
+
+    def save_prepared_broadcast(
+        self,
+        *,
+        key: str,
+        claim_token: str,
+        request_hash: str,
+        wallet: str,
+        outputs: list[dict[str, Any]],
+        psbt: str,
+        raw_tx: str,
+        expected_txid: str,
+        fee_sats: int,
+        total_output_sats: int,
+        network: str,
+    ) -> PreparedBroadcast:
+        """Persists the exact transaction before the first broadcast attempt."""
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                owner = conn.execute(
+                    """
+                    SELECT request_hash, claim_token, state, prepared_record_id
+                    FROM idempotency_records WHERE key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                if (
+                    owner is None
+                    or owner["claim_token"] != claim_token
+                    or owner["request_hash"] != request_hash
+                ):
+                    raise self._lost_claim()
+                if owner["prepared_record_id"] is not None:
+                    prepared = self._load_prepared_by_id(
+                        conn,
+                        int(owner["prepared_record_id"]),
+                        request_hash,
+                    )
+                    conn.execute("COMMIT")
+                    return prepared
+                if owner["state"] != "CLAIMED":
+                    raise self._lost_claim()
+
+                cursor = conn.execute(
+                    """
+                    INSERT INTO transaction_records(
+                      wallet, kind, request_hash, idempotency_key, outputs_json,
+                      psbt, raw_tx, txid, status, metadata_json,
+                      created_at, updated_at, network
+                    )
+                    VALUES(?, 'broadcast', ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?)
+                    """,
+                    (
+                        wallet,
+                        request_hash,
+                        key,
+                        json.dumps(outputs, sort_keys=True, separators=(",", ":")),
+                        psbt,
+                        raw_tx,
+                        expected_txid,
+                        json.dumps(
+                            {
+                                "feeSats": int(fee_sats),
+                                "totalOutputSats": int(total_output_sats),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        now,
+                        now,
+                        network,
+                    ),
                 )
+                record_id = int(cursor.lastrowid)
+                updated = conn.execute(
+                    """
+                    UPDATE idempotency_records
+                    SET state = 'PREPARED', prepared_record_id = ?, payment_hash = ?,
+                        lease_expires_at = ?, last_error = NULL
+                    WHERE key = ? AND claim_token = ? AND state = 'CLAIMED'
+                    """,
+                    (
+                        record_id,
+                        expected_txid,
+                        now + self._claim_lease_seconds,
+                        key,
+                        claim_token,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise self._lost_claim()
+                conn.execute("COMMIT")
+                return PreparedBroadcast(
+                    record_id,
+                    wallet,
+                    request_hash,
+                    list(outputs),
+                    psbt,
+                    raw_tx,
+                    expected_txid,
+                    int(fee_sats),
+                    int(total_output_sats),
+                )
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def load_prepared_broadcast(self, key: str, request_hash: str) -> PreparedBroadcast | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT prepared_record_id FROM idempotency_records
+                WHERE key = ? AND request_hash = ?
+                """,
+                (key, request_hash),
+            ).fetchone()
+            if row is None or row["prepared_record_id"] is None:
+                return None
+            return self._load_prepared_by_id(conn, int(row["prepared_record_id"]), request_hash)
+
+    def mark_broadcast(self, key: str, claim_token: str, txid: str) -> None:
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                """
+                UPDATE idempotency_records
+                SET state = 'BROADCAST', payment_hash = ?, lease_expires_at = ?, last_error = NULL
+                WHERE key = ? AND claim_token = ? AND payment_hash = ?
+                  AND state IN ('PREPARED', 'UNKNOWN', 'BROADCAST')
+                """,
+                (txid, now + self._claim_lease_seconds, key, claim_token, txid),
+            )
+            if updated.rowcount != 1:
+                conn.execute("ROLLBACK")
+                raise self._lost_claim()
             conn.execute(
                 """
-                INSERT INTO idempotency_records(key, scope, request_hash, status_code, response_json, created_at, expires_at)
-                VALUES(?, ?, ?, ?, ?, strftime('%s','now'), ?)
-                ON CONFLICT(key) DO UPDATE SET
-                  scope = excluded.scope,
-                  request_hash = excluded.request_hash,
-                  status_code = excluded.status_code,
-                  response_json = excluded.response_json,
-                  created_at = excluded.created_at,
-                  expires_at = excluded.expires_at,
-                  state = 'SUCCEEDED',
-                  settled_at = strftime('%s','now'),
-                  lease_expires_at = NULL
+                UPDATE transaction_records SET status = 'broadcast', updated_at = ?
+                WHERE id = (SELECT prepared_record_id FROM idempotency_records WHERE key = ?)
                 """,
-                (key, scope, request_hash, int(status_code), payload, expires_at),
-            )
-
-    def mark_broadcast(self, key: str, txid: str) -> None:
-        """ITEM 3: Transition from CLAIMED to BROADCAST after sendrawtransaction."""
-        now = int(time.time())
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE idempotency_records SET state='BROADCAST', payment_hash=?, lease_expires_at=? WHERE key=? AND state='CLAIMED'",
-                (txid, now + 600, key),
-            )
-
-    def mark_succeeded(self, key: str) -> None:
-        """ITEM 3: Mark claim as SUCCEEDED after confirmed broadcast."""
-        now = int(time.time())
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE idempotency_records SET state='SUCCEEDED', settled_at=? WHERE key=?",
                 (now, key),
             )
+            conn.execute("COMMIT")
 
-    def mark_failed(self, key: str, error_code: str, message: str) -> None:
-        """ITEM 3: Mark claim as FAILED_FINAL."""
+    def mark_failed(
+        self,
+        key: str,
+        claim_token: str,
+        status_code: int,
+        error_code: str,
+        message: str,
+    ) -> None:
         now = int(time.time())
         payload = json.dumps(
             {"success": False, "errorCode": error_code, "message": message},
             sort_keys=True, separators=(",", ":"),
         )
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE idempotency_records SET status_code=400, response_json=?, state='FAILED_FINAL', settled_at=? WHERE key=?",
-                (payload, now, key),
+            updated = conn.execute(
+                """
+                UPDATE idempotency_records
+                SET status_code = ?, response_json = ?, state = 'FAILED_FINAL', settled_at = ?,
+                    lease_expires_at = NULL, claim_token = NULL, last_error = ?
+                WHERE key = ? AND claim_token = ? AND state = 'CLAIMED'
+                """,
+                (int(status_code), payload, now, message[:500], key, claim_token),
             )
+            if updated.rowcount != 1:
+                raise self._lost_claim()
 
-    def mark_unknown(self, key: str, txid: str) -> None:
-        """ITEM 3: Mark as UNKNOWN after RPC timeout — blocks until reconciled."""
+    def mark_prepared_failed(
+        self,
+        key: str,
+        claim_token: str,
+        status_code: int,
+        error_code: str,
+        message: str,
+    ) -> None:
+        now = int(time.time())
+        payload = json.dumps(
+            {"success": False, "errorCode": error_code, "message": message},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                """
+                UPDATE idempotency_records
+                SET status_code = ?, response_json = ?, state = 'FAILED_FINAL', settled_at = ?,
+                    lease_expires_at = NULL, claim_token = NULL, last_error = ?
+                WHERE key = ? AND claim_token = ? AND state IN ('PREPARED', 'UNKNOWN')
+                """,
+                (int(status_code), payload, now, message[:500], key, claim_token),
+            )
+            if updated.rowcount != 1:
+                conn.execute("ROLLBACK")
+                raise self._lost_claim()
+            conn.execute(
+                """
+                UPDATE transaction_records SET status = 'rejected', updated_at = ?
+                WHERE id = (SELECT prepared_record_id FROM idempotency_records WHERE key = ?)
+                """,
+                (now, key),
+            )
+            conn.execute("COMMIT")
+
+    def mark_unknown(self, key: str, claim_token: str, txid: str, error: str) -> None:
         now = int(time.time())
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE idempotency_records SET state='UNKNOWN', payment_hash=?, lease_expires_at=? WHERE key=?",
-                (txid, now + 86400, key),
+            updated = conn.execute(
+                """
+                UPDATE idempotency_records
+                SET state = 'UNKNOWN', payment_hash = ?, lease_expires_at = ?, last_error = ?
+                WHERE key = ? AND claim_token = ? AND payment_hash = ?
+                  AND state IN ('PREPARED', 'BROADCAST', 'UNKNOWN')
+                """,
+                (
+                    txid,
+                    now + self._claim_lease_seconds,
+                    (error or "Bitcoin broadcast result is unknown")[:500],
+                    key,
+                    claim_token,
+                    txid,
+                ),
             )
+            if updated.rowcount != 1:
+                raise self._lost_claim()
 
-    def heartbeat_claim(self, key: str) -> bool:
-        """ITEM 31: Extend lease for in-progress claims."""
+    def heartbeat_claim(self, key: str, claim_token: str) -> bool:
         now = int(time.time())
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE idempotency_records SET lease_expires_at=? WHERE key=? AND state='CLAIMED'",
-                (now + 300, key),
+                """
+                UPDATE idempotency_records SET lease_expires_at = ?
+                WHERE key = ? AND claim_token = ?
+                  AND state IN ('CLAIMED', 'PREPARED', 'BROADCAST', 'UNKNOWN')
+                """,
+                (now + self._claim_lease_seconds, key, claim_token),
             )
             return cursor.rowcount > 0
+
+    def idempotency_state(self, key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT state, payment_hash, prepared_record_id, claim_token,
+                       lease_expires_at, last_error
+                FROM idempotency_records WHERE key = ?
+                """,
+                (key,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _load_prepared_by_id(
+        self,
+        conn: sqlite3.Connection,
+        record_id: int,
+        request_hash: str,
+    ) -> PreparedBroadcast:
+        row = conn.execute(
+            """
+            SELECT id, wallet, request_hash, outputs_json, psbt, raw_tx, txid, metadata_json
+            FROM transaction_records WHERE id = ? AND kind = 'broadcast'
+            """,
+            (record_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["request_hash"] != request_hash
+            or not row["psbt"]
+            or not row["raw_tx"]
+            or not row["txid"]
+        ):
+            raise ApiError(
+                500,
+                "PREPARED_BROADCAST_CORRUPT",
+                "Persisted Bitcoin broadcast state is incomplete; manual reconciliation is required.",
+            )
+        metadata = json.loads(row["metadata_json"] or "{}")
+        return PreparedBroadcast(
+            int(row["id"]),
+            str(row["wallet"]),
+            str(row["request_hash"]),
+            json.loads(row["outputs_json"]),
+            str(row["psbt"]),
+            str(row["raw_tx"]),
+            str(row["txid"]),
+            int(metadata.get("feeSats", 0)),
+            int(metadata.get("totalOutputSats", 0)),
+        )
+
+    @staticmethod
+    def _lost_claim() -> ApiError:
+        return ApiError(
+            409,
+            "IDEMPOTENCY_CLAIM_LOST",
+            "This worker no longer owns the idempotency claim.",
+        )
 
     def record_transaction(
         self,
@@ -309,13 +602,22 @@ class CohesionStore:
             return int(cursor.rowcount)
 
     def _ensure_parent(self) -> None:
-        parent = Path(self._path).expanduser().resolve().parent
-        parent.mkdir(parents=True, exist_ok=True)
+        path = Path(self._path).expanduser()
+        if path.exists() and path.is_symlink():
+            raise ValueError("BITCOIN_BACKEND_DB_PATH cannot be a symbolic link")
+        parent = path.resolve(strict=False).parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not path.exists():
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+        os.chmod(path, 0o600)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._path, timeout=5.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             with conn:
                 yield conn
@@ -325,7 +627,7 @@ class CohesionStore:
     def _init_db(self) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA synchronous=FULL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS idempotency_records (
@@ -342,7 +644,9 @@ class CohesionStore:
                   state TEXT NOT NULL DEFAULT 'CLAIMED',
                   payment_hash TEXT,
                   payment_network TEXT NOT NULL DEFAULT '',
-                  settled_at INTEGER
+                  settled_at INTEGER,
+                  prepared_record_id INTEGER,
+                  last_error TEXT
                 )
                 """
             )
@@ -350,10 +654,22 @@ class CohesionStore:
                 row[1]
                 for row in conn.execute("PRAGMA table_info(idempotency_records)").fetchall()
             }
-            if "settled_at" not in idempotency_columns:
-                conn.execute(
-                    "ALTER TABLE idempotency_records ADD COLUMN settled_at INTEGER"
-                )
+            idempotency_migrations = {
+                "claim_token": "TEXT",
+                "claimed_at": "INTEGER",
+                "lease_expires_at": "INTEGER",
+                "state": "TEXT NOT NULL DEFAULT 'CLAIMED'",
+                "payment_hash": "TEXT",
+                "payment_network": "TEXT NOT NULL DEFAULT ''",
+                "settled_at": "INTEGER",
+                "prepared_record_id": "INTEGER",
+                "last_error": "TEXT",
+            }
+            for column, definition in idempotency_migrations.items():
+                if column not in idempotency_columns:
+                    conn.execute(
+                        f"ALTER TABLE idempotency_records ADD COLUMN {column} {definition}"
+                    )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS transaction_records (
@@ -379,3 +695,10 @@ class CohesionStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_idem_expires ON idempotency_records(expires_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_idem_state ON idempotency_records(state)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_idem_lease ON idempotency_records(lease_expires_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_idem_prepared_record ON idempotency_records(prepared_record_id)"
+            )
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{self._path}{suffix}")
+            if path.exists() and not path.is_symlink():
+                os.chmod(path, 0o600)

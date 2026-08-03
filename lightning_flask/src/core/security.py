@@ -254,9 +254,10 @@ class RateLimiter:
 class RedisRateLimiter:
     """Redis-backed distributed rate limiter for multi-worker deployments."""
 
-    def __init__(self, redis_url: str, limit_per_minute: int):
+    def __init__(self, redis_url: str, limit_per_minute: int, *, fail_open: bool = True):
         self._redis_url = redis_url
         self.limit = max(1, int(limit_per_minute))
+        self._fail_open = fail_open
         self._redis: Any = None
 
     def _ensure_redis(self) -> Any:
@@ -274,9 +275,10 @@ class RedisRateLimiter:
     def check(self, key: str) -> None:
         r = self._ensure_redis()
         if r is False:
-            logger.warning("Using in-memory rate limiting — not suitable for multi-worker deployment")
-            # Fall back to simple in-memory check
-            return
+            if self._fail_open:
+                logger.warning("Redis rate limiting unavailable; allowing request in development mode")
+                return
+            raise ApiError("Rate limit service is unavailable", 503, "rate_limit_unavailable")
         try:
             redis_key = f"ratelimit:{key}:60"
             count = r.incr(redis_key)
@@ -284,6 +286,10 @@ class RedisRateLimiter:
                 r.expire(redis_key, 60)
             if count > self.limit:
                 raise ApiError("Too many requests", 429, "rate_limited")
-        except Exception:
-            logger.warning("Redis rate limit check failed, allowing request")
-            return
+        except ApiError:
+            raise
+        except Exception as exc:
+            logger.warning("Redis rate limit check failed: %s", exc)
+            if self._fail_open:
+                return
+            raise ApiError("Rate limit service is unavailable", 503, "rate_limit_unavailable") from exc

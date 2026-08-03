@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from ipaddress import ip_address
+from pathlib import Path
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -16,7 +19,7 @@ class Settings:
     lnd_macaroon_path: str = ""
     lnd_tls_cert_path: str = ""
     lnd_timeout_seconds: float = 8.0
-    sqlite_path: str = "lightning_backend.sqlite3"
+    sqlite_path: str = "/var/lib/kerosene/lightning-backend/state.sqlite3"
     max_body_bytes: int = 64 * 1024
     rate_limit_per_minute: int = 120
     rate_limit_backend: str = "memory"
@@ -31,6 +34,9 @@ class Settings:
     default_invoice_expiry_seconds: int = 3600
     auth_disabled: bool = False
     production: bool = False
+    tls_enabled: bool = False
+    allow_insecure_lnd: bool = False
+    instance_count: int = 1
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -53,7 +59,10 @@ class Settings:
             lnd_macaroon_path=os.getenv("LIGHTNING_LND_MACAROON_PATH", ""),
             lnd_tls_cert_path=os.getenv("LIGHTNING_LND_TLS_CERT_PATH", ""),
             lnd_timeout_seconds=float(os.getenv("LIGHTNING_LND_TIMEOUT_SECONDS", "8")),
-            sqlite_path=os.getenv("LIGHTNING_BACKEND_SQLITE", "lightning_backend.sqlite3"),
+            sqlite_path=os.getenv(
+                "LIGHTNING_BACKEND_SQLITE",
+                "/var/lib/kerosene/lightning-backend/state.sqlite3",
+            ),
             max_body_bytes=int(os.getenv("LIGHTNING_BACKEND_MAX_BODY_BYTES", str(64 * 1024))),
             rate_limit_per_minute=int(os.getenv("LIGHTNING_BACKEND_RATE_LIMIT_PER_MINUTE", "120")),
             rate_limit_backend=os.getenv("LIGHTNING_RATE_LIMIT_BACKEND", "memory").lower(),
@@ -68,16 +77,19 @@ class Settings:
             default_invoice_expiry_seconds=int(os.getenv("LIGHTNING_DEFAULT_INVOICE_EXPIRY_SECONDS", "3600")),
             auth_disabled=auth_disabled,
             production=production,
+            tls_enabled=_bool_env("LIGHTNING_TLS_ENABLED"),
+            allow_insecure_lnd=_bool_env("LIGHTNING_LND_ALLOW_INSECURE"),
+            instance_count=_int_env("LIGHTNING_BACKEND_INSTANCE_COUNT", 1, 1),
         )
 
-    def validate(self) -> None:
-        # ITEM 25: prohibit disabled auth in production
-        if self.auth_disabled and self.production:
+    def validate(self, bind_host: str | None = None) -> None:
+        host = (bind_host or os.getenv("HOST", "127.0.0.1")).strip()
+        externally_bound = not _is_loopback_host(host)
+        production = self.production or externally_bound
+        if self.auth_disabled and production:
             raise ValueError("LIGHTNING_AUTH_DISABLED cannot be true in production")
-        # ITEM 25: prohibit disabled auth on non-loopback bind
-        host = os.getenv("HOST", "127.0.0.1").strip()
-        if self.auth_disabled and host not in {"127.0.0.1", "localhost", "::1"}:
-            raise ValueError("Auth cannot be disabled when binding to non-loopback address")
+        if externally_bound and not self.tls_enabled:
+            raise ValueError("LIGHTNING_TLS_ENABLED=true is required on a non-loopback bind")
 
         # ITEM 24: validate token entropy (min 32 bytes = 64 hex or ~43 base64)
         def _valid_token(tok: str) -> bool:
@@ -117,3 +129,65 @@ class Settings:
             raise ValueError("LIGHTNING_RATE_LIMIT_BACKEND must be 'memory' or 'redis'")
         if self.rate_limit_backend == "redis" and not self.redis_url:
             raise ValueError("LIGHTNING_REDIS_URL is required when LIGHTNING_RATE_LIMIT_BACKEND=redis")
+        if production:
+            if not self.read_token or not self.write_token:
+                raise ValueError("LIGHTNING_READ_TOKEN and LIGHTNING_WRITE_TOKEN are required in production")
+            self._validate_lnd_transport()
+            self._validate_state_store()
+
+    def _validate_lnd_transport(self) -> None:
+        parsed = urlparse(self.lnd_rest_url)
+        if parsed.scheme == "https":
+            return
+        if parsed.scheme != "http" or not self.allow_insecure_lnd:
+            raise ValueError(
+                "LIGHTNING_LND_REST_URL must use HTTPS in production; "
+                "LIGHTNING_LND_ALLOW_INSECURE=true is restricted to isolated private networks"
+            )
+        if not _is_private_host(parsed.hostname or ""):
+            raise ValueError("Insecure LND transport is only permitted for private service hosts")
+
+    def _validate_state_store(self) -> None:
+        path = Path(self.sqlite_path).expanduser()
+        if not path.is_absolute():
+            raise ValueError("LIGHTNING_BACKEND_SQLITE must be an absolute persistent path in production")
+        resolved = path.resolve(strict=False)
+        ephemeral_roots = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
+        if any(resolved == root or root in resolved.parents for root in ephemeral_roots):
+            raise ValueError("LIGHTNING_BACKEND_SQLITE cannot use ephemeral storage in production")
+        if self.instance_count != 1:
+            raise ValueError(
+                "The SQLite idempotency store requires LIGHTNING_BACKEND_INSTANCE_COUNT=1; "
+                "run a single replica with a persistent volume"
+            )
+
+
+def _bool_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_env(name: str, default: int, minimum: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized in {"localhost", "ip6-localhost"}:
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_private_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if _is_loopback_host(normalized):
+        return True
+    try:
+        return ip_address(normalized).is_private
+    except ValueError:
+        return "." not in normalized or normalized.endswith((".internal", ".local", ".svc", ".svc.cluster.local"))

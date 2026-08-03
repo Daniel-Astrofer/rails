@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
+import uuid
+
+from src.core.security import ApiError
 
 
 # Sensitive fields stripped from event metadata before storage.
@@ -18,16 +23,27 @@ SENSITIVE_KEYS = {"macaroon", "paymentRequest", "preimage", "payment_preimage", 
 RESPONSE_SENSITIVE_KEYS = {"payment_preimage", "payment_route"}
 
 
-class CohesionStore:
-    """ITEM 2 + ITEM 3: Extended idempotency store with state machine.
-    States: CLAIMED → SUBMITTED → SUCCEEDED / FAILED_FINAL / UNKNOWN
-    Claims use lease + ownership token pattern with long TTL for financial audit."""
+@dataclass(frozen=True)
+class IdempotencyClaim:
+    key: str
+    token: str
+    state: str
+    payment_hash: str | None
 
-    def __init__(self, path: str):
+
+@dataclass(frozen=True)
+class IdempotencyReplay:
+    payload: dict[str, Any]
+    status_code: int
+
+
+class CohesionStore:
+    """Durable Lightning idempotency state with lease fencing."""
+
+    def __init__(self, path: str, claim_lease_seconds: int = 300):
         self.path = path
-        parent = Path(path).parent
-        if parent != Path("."):
-            parent.mkdir(parents=True, exist_ok=True)
+        self.claim_lease_seconds = max(5, int(claim_lease_seconds))
+        self._ensure_path()
         self._init_db()
 
     @contextmanager
@@ -37,6 +53,8 @@ class CohesionStore:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA synchronous=FULL")
             yield conn
         finally:
             conn.close()
@@ -57,7 +75,8 @@ class CohesionStore:
                     state TEXT NOT NULL DEFAULT 'CLAIMED',
                     payment_hash TEXT,
                     payment_network TEXT NOT NULL DEFAULT '',
-                    settled_at INTEGER
+                    settled_at INTEGER,
+                    last_error TEXT
                 );
                 CREATE TABLE IF NOT EXISTS lightning_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,154 +94,226 @@ class CohesionStore:
                 CREATE INDEX IF NOT EXISTS idx_idempotency_lease ON idempotency(lease_expires_at);
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(idempotency)").fetchall()}
+            migrations = {
+                "claim_token": "TEXT",
+                "claimed_at": "INTEGER",
+                "lease_expires_at": "INTEGER",
+                "state": "TEXT NOT NULL DEFAULT 'CLAIMED'",
+                "payment_hash": "TEXT",
+                "payment_network": "TEXT NOT NULL DEFAULT ''",
+                "settled_at": "INTEGER",
+                "last_error": "TEXT",
+            }
+            for column, definition in migrations.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE idempotency ADD COLUMN {column} {definition}")
+        self._restrict_permissions()
 
     def claim_idempotent(
         self, key: str, fingerprint: str, *, payment_hash: str | None = None, network: str = "",
-    ) -> tuple[dict[str, Any], int] | None:
-        """ITEM 2: Atomic idempotency claim with lease + ownership token pattern.
-        First process gets CLAIMED ownership, others get replay or 409 conflict.
-        Namespaced key: principal_id:idempotency_key"""
-        import uuid
+    ) -> IdempotencyClaim | IdempotencyReplay:
         now = int(time.time())
-        lease_seconds = 300  # 5 minute lease for CLAIMED state
         claim_token = str(uuid.uuid4())
-
         with self._conn() as conn:
-            # Try atomic claim with INSERT OR IGNORE inside explicit transaction
             conn.execute("BEGIN IMMEDIATE")
             try:
-                cursor = conn.execute(
+                row = conn.execute(
                     """
-                    INSERT OR IGNORE INTO idempotency(key, fingerprint, status_code, response_json, created_at,
-                                                     claim_token, claimed_at, lease_expires_at, state, payment_hash, payment_network)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    SELECT fingerprint, status_code, response_json, claim_token, state,
+                           lease_expires_at, payment_hash
+                    FROM idempotency WHERE key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO idempotency(
+                            key, fingerprint, status_code, response_json, created_at,
+                            claim_token, claimed_at, lease_expires_at, state,
+                            payment_hash, payment_network
+                        )
+                        VALUES (?, ?, -1, '{}', ?, ?, ?, ?, 'CLAIMED', ?, ?)
+                        """,
+                        (
+                            key,
+                            fingerprint,
+                            now,
+                            claim_token,
+                            now,
+                            now + self.claim_lease_seconds,
+                            payment_hash or "",
+                            network,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                    return IdempotencyClaim(key, claim_token, "CLAIMED", payment_hash)
+
+                if row["fingerprint"] != fingerprint:
+                    raise ApiError(
+                        "Idempotency-Key was reused with a different request",
+                        409,
+                        "idempotency_conflict",
+                    )
+                state = str(row["state"])
+                if state in {"SUCCEEDED", "FAILED_FINAL"}:
+                    conn.execute("COMMIT")
+                    return IdempotencyReplay(
+                        json.loads(row["response_json"]),
+                        int(row["status_code"]),
+                    )
+                if row["claim_token"] and int(row["lease_expires_at"] or 0) > now:
+                    raise ApiError(
+                        "Request with this Idempotency-Key is still in progress",
+                        409,
+                        "idempotency_in_progress",
+                    )
+                updated = conn.execute(
+                    """
+                    UPDATE idempotency
+                    SET claim_token = ?, claimed_at = ?, lease_expires_at = ?
+                    WHERE key = ? AND fingerprint = ?
+                      AND (claim_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
                     """,
                     (
-                        key, fingerprint, -1, "{}", now,
-                        claim_token, now, now + lease_seconds, "CLAIMED",
-                        payment_hash or "", network,
+                        claim_token,
+                        now,
+                        now + self.claim_lease_seconds,
+                        key,
+                        fingerprint,
+                        now,
                     ),
                 )
-                inserted = cursor.rowcount == 1
+                if updated.rowcount != 1:
+                    raise ApiError(
+                        "Request with this Idempotency-Key is still in progress",
+                        409,
+                        "idempotency_in_progress",
+                    )
                 conn.execute("COMMIT")
+                existing_hash = str(row["payment_hash"] or "") or payment_hash
+                return IdempotencyClaim(key, claim_token, state, existing_hash)
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
 
-            row = conn.execute(
-                """SELECT fingerprint, status_code, response_json, created_at, claim_token, state,
-                   lease_expires_at, payment_hash FROM idempotency WHERE key = ?""",
-                (key,),
-            ).fetchone()
-
-        if row is None:
-            return None
-
-        # Conflict: different fingerprint with same key
-        if row["fingerprint"] != fingerprint:
-            from src.core.security import ApiError
-            raise ApiError(
-                "Idempotency-Key was reused with a different request", 409, "idempotency_conflict",
-            )
-
-        state = row["state"]
-        if state in ("SUCCEEDED", "FAILED_FINAL"):
-            return json.loads(row["response_json"]), int(row["status_code"])
-
-        if state == "CLAIMED":
-            lease_expires = int(row["lease_expires_at"])
-            if not inserted:
-                # Another process owns the claim
-                if now < lease_expires:
-                    from src.core.security import ApiError
-                    raise ApiError(
-                        "Request with this Idempotency-Key is still in progress", 409, "idempotency_in_progress",
-                    )
-                # Stale lease: another process timed out, but we cannot auto-retry
-                # Return UNKNOWN so caller knows to reconcile
-                return json.loads('{"success":false,"error":{"code":"idempotency_unknown","message":"Previous request timed out. Reconcile before retrying."}}'), 409
-            # Claim succeeded — store claim_token in g for caller
-            return None
-
-        if state == "SUBMITTED":
-            # In-flight at LND, return in-progress
-            from src.core.security import ApiError
-            raise ApiError(
-                "Request is being processed by LND", 409, "idempotency_in_progress",
-            )
-
-        if state == "UNKNOWN":
-            # Previous request timed out after LND call
-            return json.loads('{"success":false,"error":{"code":"idempotency_unknown","message":"Previous request result unknown. Reconcile before retrying."}}'), 409
-
-        # Fallback: stale/unclaimed record
-        if int(row["status_code"]) == -1:
-            if not inserted:
-                if now - int(row["created_at"]) > lease_seconds:
-                    # Re-claim stale record
-                    new_claim = str(uuid.uuid4())
-                    with self._conn() as conn:
-                        conn.execute(
-                            "UPDATE idempotency SET claim_token=?, claimed_at=?, lease_expires_at=?, state='CLAIMED' WHERE key=? AND fingerprint=?",
-                            (new_claim, now, now + lease_seconds, key, fingerprint),
-                        )
-                    return None
-                from src.core.security import ApiError
-                raise ApiError("Request with this Idempotency-Key is still in progress", 409, "idempotency_in_progress")
-            return None
-
-        return json.loads(row["response_json"]), int(row["status_code"])
-
-    def save_idempotent(self, key: str, fingerprint: str, response: dict[str, Any], status_code: int) -> None:
+    def save_idempotent(
+        self,
+        key: str,
+        fingerprint: str,
+        claim_token: str,
+        response: dict[str, Any],
+        status_code: int,
+    ) -> None:
         safe_response = _strip_keys(response, RESPONSE_SENSITIVE_KEYS)
         with self._conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE idempotency
-                SET status_code = ?, response_json = ?, state = 'SUCCEEDED', settled_at = ?
-                WHERE key = ? AND fingerprint = ?
+                SET status_code = ?, response_json = ?, state = 'SUCCEEDED', settled_at = ?,
+                    claim_token = NULL, lease_expires_at = NULL, last_error = NULL
+                WHERE key = ? AND fingerprint = ? AND claim_token = ?
+                  AND state IN ('CLAIMED', 'SUBMITTED', 'UNKNOWN')
                 """,
-                (status_code, json.dumps(safe_response, separators=(",", ":")), int(time.time()), key, fingerprint),
+                (
+                    status_code,
+                    json.dumps(safe_response, separators=(",", ":")),
+                    int(time.time()),
+                    key,
+                    fingerprint,
+                    claim_token,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise self._lost_claim()
 
-    def mark_submitted(self, key: str, fingerprint: str, payment_hash: str) -> None:
-        """ITEM 2: Transition claim from CLAIMED to SUBMITTED after LND call."""
+    def mark_submitted(self, key: str, fingerprint: str, claim_token: str, payment_hash: str) -> None:
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE idempotency SET state='SUBMITTED', payment_hash=? WHERE key=? AND fingerprint=? AND state='CLAIMED'",
-                (payment_hash, key, fingerprint),
+            cursor = conn.execute(
+                """
+                UPDATE idempotency
+                SET state = 'SUBMITTED', payment_hash = ?, lease_expires_at = ?
+                WHERE key = ? AND fingerprint = ? AND claim_token = ? AND state = 'CLAIMED'
+                """,
+                (
+                    payment_hash,
+                    int(time.time()) + self.claim_lease_seconds,
+                    key,
+                    fingerprint,
+                    claim_token,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise self._lost_claim()
 
-    def mark_failed(self, key: str, fingerprint: str, error_code: str, message: str) -> None:
-        """ITEM 2: Mark claim as FAILED_FINAL after a definitive failure."""
+    def mark_failed(
+        self,
+        key: str,
+        fingerprint: str,
+        claim_token: str,
+        error_code: str,
+        message: str,
+        status_code: int = 400,
+    ) -> None:
         now = int(time.time())
         payload = json.dumps(
             {"success": False, "error": {"code": error_code, "message": message}},
             separators=(",", ":"),
         )
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE idempotency SET status_code=400, response_json=?, state='FAILED_FINAL', settled_at=? WHERE key=? AND fingerprint=?",
-                (payload, now, key, fingerprint),
+            cursor = conn.execute(
+                """
+                UPDATE idempotency
+                SET status_code = ?, response_json = ?, state = 'FAILED_FINAL', settled_at = ?,
+                    claim_token = NULL, lease_expires_at = NULL, last_error = ?
+                WHERE key = ? AND fingerprint = ? AND claim_token = ?
+                  AND state IN ('CLAIMED', 'SUBMITTED', 'UNKNOWN')
+                """,
+                (status_code, payload, now, message[:500], key, fingerprint, claim_token),
             )
+            if cursor.rowcount != 1:
+                raise self._lost_claim()
 
-    def mark_unknown(self, key: str, fingerprint: str, payment_hash: str) -> None:
-        """ITEM 2: Mark claim as UNKNOWN after LND timeout.
-        Blocks new payments until reconciled."""
-        now = int(time.time())
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE idempotency SET state='UNKNOWN', payment_hash=?, lease_expires_at=? WHERE key=? AND fingerprint=?",
-                (payment_hash, now + 86400, key, fingerprint),
-            )
-
-    def heartbeat_claim(self, key: str, fingerprint: str) -> bool:
-        """ITEM 31: Extend lease for in-progress claims. Only owner can heartbeat."""
+    def mark_unknown(
+        self,
+        key: str,
+        fingerprint: str,
+        claim_token: str,
+        payment_hash: str,
+        error: str,
+    ) -> None:
         now = int(time.time())
         with self._conn() as conn:
             cursor = conn.execute(
-                "UPDATE idempotency SET lease_expires_at=? WHERE key=? AND fingerprint=? AND state='CLAIMED'",
-                (now + 300, key, fingerprint),
+                """
+                UPDATE idempotency
+                SET state = 'UNKNOWN', payment_hash = ?, lease_expires_at = ?, last_error = ?
+                WHERE key = ? AND fingerprint = ? AND claim_token = ?
+                  AND state IN ('SUBMITTED', 'UNKNOWN')
+                """,
+                (
+                    payment_hash,
+                    now + self.claim_lease_seconds,
+                    (error or "Lightning payment result is unknown")[:500],
+                    key,
+                    fingerprint,
+                    claim_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise self._lost_claim()
+
+    def heartbeat_claim(self, key: str, fingerprint: str, claim_token: str) -> bool:
+        now = int(time.time())
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE idempotency SET lease_expires_at = ?
+                WHERE key = ? AND fingerprint = ? AND claim_token = ?
+                  AND state IN ('CLAIMED', 'SUBMITTED', 'UNKNOWN')
+                """,
+                (now + self.claim_lease_seconds, key, fingerprint, claim_token),
             )
             return cursor.rowcount > 0
 
@@ -237,6 +328,42 @@ class CohesionStore:
             return None
         return {"key": row["key"], "state": row["state"], "status_code": row["status_code"],
                 "response": json.loads(row["response_json"])}
+
+    def state(self, key: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT state, payment_hash, claim_token, lease_expires_at, last_error
+                FROM idempotency WHERE key = ?
+                """,
+                (key,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _lost_claim() -> ApiError:
+        return ApiError(
+            "This worker no longer owns the idempotency claim",
+            409,
+            "idempotency_claim_lost",
+        )
+
+    def _ensure_path(self) -> None:
+        path = Path(self.path).expanduser()
+        if path.exists() and path.is_symlink():
+            raise ValueError("LIGHTNING_BACKEND_SQLITE cannot be a symbolic link")
+        parent = path.resolve(strict=False).parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not path.exists():
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+        os.chmod(path, 0o600)
+
+    def _restrict_permissions(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{self.path}{suffix}")
+            if path.exists() and not path.is_symlink():
+                os.chmod(path, 0o600)
 
     def append_event(
         self,

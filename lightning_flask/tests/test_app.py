@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 if importlib.util.find_spec("flask") is None:
     raise unittest.SkipTest("Flask is not installed")
@@ -165,6 +166,37 @@ class LightningAppTests(unittest.TestCase):
     def test_lookup_payment_hash_validation(self):
         response = self.client.get("/v1/payments/nothex", headers=self.headers)
         self.assertEqual(400, response.status_code)
+
+    def test_timeout_retry_reconciles_without_second_payment(self):
+        calls = 0
+
+        def timeout(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise TimeoutError("LND response timed out")
+
+        self.lnd.pay_invoice = timeout
+        headers = {
+            **self.headers,
+            "Content-Type": "application/json",
+            "Idempotency-Key": "payment-timeout-0001",
+        }
+        body = {"payment_request": INVOICE, "fee_limit_sats": 10, "timeout_seconds": 30}
+        with patch("src.infra.cohesion.time.time", return_value=1000):
+            first = self.client.post("/v1/payments", json=body, headers=headers)
+
+        self.assertEqual(504, first.status_code)
+        self.lnd.lookup_payment = lambda payment_hash: {
+            "payment_hash": payment_hash,
+            "status": "SUCCEEDED",
+            "fee_sats": 2,
+        }
+        with patch("src.infra.cohesion.time.time", return_value=1301):
+            second = self.client.post("/v1/payments", json=body, headers=headers)
+
+        self.assertEqual(202, second.status_code, second.get_json())
+        self.assertEqual("SUCCEEDED", second.get_json()["payment"]["status"])
+        self.assertEqual(1, calls)
 
 
 if __name__ == "__main__":
