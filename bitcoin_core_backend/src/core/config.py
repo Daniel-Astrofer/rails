@@ -166,6 +166,11 @@ class AppConfig:
 
     def validate(self, bind_host: str) -> None:
         host = (bind_host or "").strip().lower()
+        # When host is unset but production mode is true, assume externally bound.
+        # The real bind is set independently by the WSGI launcher (gunicorn --bind).
+        # Failing closed: if production=true and HOST is default/loopback, enforce TLS anyway.
+        if self.production and (not host or host == "127.0.0.1" or host == "localhost"):
+            host = "0.0.0.0"
         externally_bound = not _is_loopback_host(host)
         production = self.production or externally_bound
 

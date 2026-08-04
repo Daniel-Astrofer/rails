@@ -84,6 +84,10 @@ class Settings:
 
     def validate(self, bind_host: str | None = None) -> None:
         host = (bind_host or os.getenv("HOST", "127.0.0.1")).strip()
+        # When production=true and HOST is default/loopback, assume externally bound.
+        # The real bind is set independently by the WSGI launcher.
+        if self.production and (not host or host == "127.0.0.1" or host == "localhost"):
+            host = "0.0.0.0"
         externally_bound = not _is_loopback_host(host)
         production = self.production or externally_bound
         if self.auth_disabled and production:
