@@ -26,7 +26,7 @@ BITCOIN_BACKEND_DB_PATH=/var/lib/kerosene/bitcoin-core-backend.sqlite3
 ## Executar
 
 ```sh
-cd backend/adapters/bitcoin_core_backend
+cd bitcoin_core_backend
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt

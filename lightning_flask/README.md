@@ -13,7 +13,7 @@ Este serviço:
 ## Diretório
 
 ```text
-backend/adapters/lightning_flask/
+lightning_flask/
   app.py              Flask app factory, rotas, hooks de autenticação, tratamento de erros
   config.py           Configurações baseadas em variáveis de ambiente
   lnd.py              Cliente REST LND e normalização de respostas
@@ -36,7 +36,7 @@ backend/adapters/lightning_flask/
 Instale a dependência Python:
 
 ```bash
-cd backend/adapters/lightning_flask
+cd lightning_flask
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -69,7 +69,7 @@ A aplicação lê configurações de variáveis de ambiente por padrão.
 Inicie o serviço contra um endpoint LND REST local:
 
 ```bash
-cd backend/adapters/lightning_flask
+cd lightning_flask
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -169,11 +169,11 @@ Este serviço é adequado para ser usado atrás de um limite de rede privada, ga
 Execute os testes unitários:
 
 ```bash
-cd backend/adapters/lightning_flask
+cd lightning_flask
 python -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
-python -m unittest discover -s tests
+pip install -r requirements-test.txt
+python -m pytest tests
 ```
 
 Os testes usam um cliente LND fake e não requerem um nó LND ativo.

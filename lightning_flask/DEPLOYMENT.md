@@ -19,7 +19,7 @@ Mantenha o serviço Flask e o endpoint LND REST em uma rede privada. Não publiq
 ## Pré-requisitos de Execução
 
 - Python 3.10+.
-- `backend/adapters/lightning_flask/requirements.txt` instalado em um ambiente virtual.
+- `lightning_flask/requirements.txt` instalado em um ambiente virtual.
 - Um token `KEROSENE_API_TOKEN` longo e aleatório.
 - LND REST acessível a partir do host ou contêiner.
 - Um macaroon com as permissões necessárias para:
@@ -70,7 +70,7 @@ sudo install -d -m 0750 -o kerosene -g kerosene /var/lib/kerosene/lightning
 
 cd /opt/kerosene
 sudo git clone /path/or/url/to/Kerosene repo
-cd repo/backend/adapters/lightning_flask
+cd kerosene-rails/lightning_flask
 sudo -u kerosene python -m venv .venv
 sudo -u kerosene .venv/bin/pip install -r requirements.txt
 ```
@@ -80,7 +80,7 @@ Para um repositório já presente no host, use o caminho real do checkout em vez
 ## Executar com Flask para Desenvolvimento
 
 ```bash
-cd backend/adapters/lightning_flask
+cd lightning_flask
 set -a
 . /etc/kerosene/lightning-flask.env
 set +a
@@ -94,7 +94,7 @@ O servidor de desenvolvimento do Flask é aceitável apenas para desenvolvimento
 `gunicorn` não está listado em `requirements.txt`, portanto instale-o no ambiente de execução se você usar este modelo de processo:
 
 ```bash
-cd backend/adapters/lightning_flask
+cd lightning_flask
 . .venv/bin/activate
 pip install gunicorn
 gunicorn 'app:create_app()' \
@@ -122,9 +122,9 @@ Wants=network-online.target
 Type=simple
 User=kerosene
 Group=kerosene
-WorkingDirectory=/opt/kerosene/repo/backend/adapters/lightning_flask
+WorkingDirectory=/opt/kerosene/kerosene-rails/lightning_flask
 EnvironmentFile=/etc/kerosene/lightning-flask.env
-ExecStart=/opt/kerosene/repo/backend/adapters/lightning_flask/.venv/bin/flask --app app:create_app run --host 127.0.0.1 --port 8091
+ExecStart=/opt/kerosene/kerosene-rails/lightning_flask/.venv/bin/flask --app app:create_app run --host 127.0.0.1 --port 8091
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -140,7 +140,7 @@ WantedBy=multi-user.target
 Para produção, substitua `ExecStart` por um servidor WSGI como o Gunicorn após instalá-lo:
 
 ```ini
-ExecStart=/opt/kerosene/repo/backend/adapters/lightning_flask/.venv/bin/gunicorn app:create_app() --bind 127.0.0.1:8091 --workers 2 --threads 4 --timeout 30
+ExecStart=/opt/kerosene/kerosene-rails/lightning_flask/.venv/bin/gunicorn app:create_app() --bind 127.0.0.1:8091 --workers 2 --threads 4 --timeout 30
 ```
 
 Em seguida, habilite o serviço:
@@ -170,9 +170,9 @@ Certifique-se de que o proxy não registre `Authorization`, `Idempotency-Key`, f
 
 ## Notas sobre Contêineres
 
-Não há um Dockerfile dedicado para `backend/adapters/lightning_flask` neste repositório. Se você o empacotar como um contêiner:
+Não há um Dockerfile dedicado para `lightning_flask` neste repositório. Se você o empacotar como um contêiner:
 
-- Use o diretório `backend/adapters/lightning_flask` como diretório de trabalho do aplicativo.
+- Use o diretório `lightning_flask` como diretório de trabalho do aplicativo.
 - Instale `requirements.txt` mais um servidor WSGI, se necessário.
 - Monte o macaroon e o certificado TLS do LND como somente leitura.
 - Monte um volume gravável persistente para o SQLite.
@@ -191,7 +191,7 @@ EXPOSE 8091
 CMD ["gunicorn", "app:create_app()", "--bind", "0.0.0.0:8091", "--workers", "2", "--threads", "4"]
 ```
 
-Compile a partir de `backend/adapters/lightning_flask` se usar esse exemplo.
+Compile a partir de `lightning_flask` se usar esse exemplo.
 
 ## Integração com LND
 
